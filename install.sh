@@ -68,9 +68,15 @@ deckard_bootstrap() (
   [ "${#expected}" -eq 64 ] || fail 'Invalid pinned archive SHA-256.'
   case "$app_expected" in ''|*[!0-9a-f]*) fail 'Missing pinned app archive SHA-256.' ;; esac
   [ "${#app_expected}" -eq 64 ] || fail 'Invalid pinned app archive SHA-256.'
-  for tool in curl shasum tar awk sort uniq wc readlink; do
+  if command -v shasum >/dev/null 2>&1; then
+    SHASUM='shasum -a 256'
+  else
+    SHASUM='sha256sum'
+  fi
+  for tool in curl tar awk sort uniq wc readlink; do
     command -v "$tool" >/dev/null || fail "Required command not found: $tool"
   done
+  command -v ${SHASUM%% *} >/dev/null || fail "Required command not found: ${SHASUM%% *}"
   printf '%s\n' "$model_sums" | awk '
     NF != 2 || length($1) != 64 || $1 ~ /[^0-9a-f]/ { exit 1 }
     $2 !~ /^[A-Za-z0-9_.\/-]+$/ || $2 ~ /^\// || $2 ~ /(^|\/)\.\.?($|\/)/ || $2 ~ /\/\// { exit 1 }
@@ -96,7 +102,7 @@ deckard_bootstrap() (
       done
       file="$directory/$remaining"
       [ -f "$file" ] && [ ! -L "$file" ] || exit 1
-      actual=$(shasum -a 256 "$file") || exit 1
+      actual=$($SHASUM "$file") || exit 1
       [ "${actual%% *}" = "$checksum" ] || exit 1
     done <<< "$model_sums"
     printf '%s\n' "$source"
@@ -124,7 +130,7 @@ deckard_bootstrap() (
   archive_bytes=$(wc -c < "$archive")
   [ "$archive_bytes" -gt 0 ] && [ "$archive_bytes" -lt 2147483648 ] ||
     fail 'Release archive must be under 2147483648 bytes (2 GiB).'
-  actual=$(shasum -a 256 "$archive")
+  actual=$($SHASUM "$archive")
   actual=${actual%% *}
   [ "$actual" = "$expected" ] || fail 'Archive SHA-256 checksum mismatch; nothing was installed.'
   tar -tzf "$archive" > "$work/entries" || fail 'Cannot inspect release archive.'
@@ -154,8 +160,13 @@ deckard_bootstrap() (
   [ -z "$(awk '{ sub(/\/$/, ""); print }' "$work/entries" | sort | uniq -d)" ] ||
     fail 'Duplicate archive paths are not permitted.'
   mkdir "$work/bundle"
-  tar -xzf "$archive" -C "$work/bundle" --no-same-owner --no-same-permissions \
-    --no-xattrs --no-acls --no-fflags || fail 'Archive extraction failed.'
+  if tar --version 2>/dev/null | head -1 | grep -q 'GNU tar'; then
+    tar -xzf "$archive" -C "$work/bundle" --no-same-owner --no-same-permissions \
+      --no-xattrs --no-acls || fail 'Archive extraction failed.'
+  else
+    tar -xzf "$archive" -C "$work/bundle" --no-same-owner --no-same-permissions \
+      --no-xattrs --no-acls --no-fflags || fail 'Archive extraction failed.'
+  fi
   bundle="$work/bundle"
   if [ -z "$model_source" ]; then model_source="$bundle/models"; fi
   [ -x "$bundle/bin/deckard" ] &&

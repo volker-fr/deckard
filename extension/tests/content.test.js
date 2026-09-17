@@ -371,16 +371,17 @@ test("a complete 50-word passage is scored and marked without changing the cutof
 });
 
 test("low, partial, or short-chunk results leave no page annotations", async () => {
-  for (const value of [
-    { ...result, score: 0.45, min_score: 0.4, max_score: 0.5 },
-    { ...result, status: "partial" }, { ...result, truncated: true },
-    { ...result, chunks: [{ ...result.chunks[0], words: 25 }] },
+  for (const [value, expectedClear] of [
+    [{ ...result, score: 0.45, min_score: 0.4, max_score: 0.5 }, 1],
+    [{ ...result, status: "partial" }, 0], [{ ...result, truncated: true }, 0],
+    [{ ...result, chunks: [{ ...result.chunks[0], words: 25 }] }, 0],
   ]) {
     const h = await harness();
     await h.start();
     await h.finish(0, value);
     assert.equal(h.blocks[0].classes.size, 0);
     assert.equal((await h.send({ type: "PAGE_STATUS" })).analyzed, 1);
+    assert.equal((await h.send({ type: "PAGE_STATUS" })).clear, expectedClear);
     assert.equal(h.root.children.filter(node => node.shadow).length, 0);
     assert.deepEqual(h.root.children, h.blocks, "no stylesheet or annotation for ineligible results");
     assert.equal((await h.send({ type: "PAGE_STATUS" })).marked, 0);

@@ -1,6 +1,6 @@
 #include "support.hpp"
 #include "host.hpp"
-#include "coreml_gradient.hpp"
+#include "gradient_backend.hpp"
 #include "tokenizer.hpp"
 #include "setup.hpp"
 #include <algorithm>
@@ -110,11 +110,15 @@ fs::path installation_prefix() {
     auto distribution = executable_path().parent_path().parent_path();
     if (distribution.parent_path().filename() == "releases" && fs::is_regular_file(distribution / "install.json"))
         return distribution.parent_path().parent_path();
+#if defined(__APPLE__)
     return user_home() / "Deckard";
+#elif defined(__linux__)
+    return user_home() / ".local/share/deckard";
+#endif
 }
 void install(const Options& options) {
     allow_options(options, {"--home", "--extension-id", "--manifest-dir", "--model-dir",
-                           "--replace", "--no-register", "--extension-dir", "--shell", "--no-extension"});
+                           "--replace", "--no-register", "--extension-dir", "--shell", "--no-extension", "--no-download"});
     if (options.has("--extension-dir") && options.has("--no-extension"))
         throw Error("arguments", "Use either --extension-dir or --no-extension, not both.");
     background();
@@ -129,8 +133,7 @@ void install(const Options& options) {
     if (old_setup && old_setup->value("uninstalling", false))
         throw Error("pending_uninstall", "Finish the interrupted deckard uninstall before installing again.");
     fs::path manifest_dir = (options.has("--manifest-dir") ? fs::absolute(options.get("--manifest-dir")) :
-        old_setup ? fs::path((*old_setup)["manifest_dir"].get<std::string>()) :
-        user_home() / "Library/Application Support/Google/Chrome/NativeMessagingHosts").lexically_normal();
+        old_setup ? fs::path((*old_setup)["manifest_dir"].get<std::string>()) : default_manifest_dir()).lexically_normal();
     require_plain_path(manifest_dir, true);
     auto registration = manifest_dir / (std::string(host_name) + ".json");
     require_plain_path(registration, false);
@@ -138,7 +141,7 @@ void install(const Options& options) {
     if (!extension_id_valid(id))
         throw Error("extension_id", "Pass --extension-id with the 32-letter ID from chrome://extensions, or use --no-register.");
     Json manifest = {
-        {"name", host_name}, {"description", "Deckard native Gradient Core ML (experimental marking)"},
+        {"name", host_name}, {"description", native_description},
         {"path", (prefix / "current/bin/deckard-host").string()}, {"type", "stdio"},
         {"allowed_origins", Json::array({"chrome-extension://" + id + "/"})},
     };
@@ -188,8 +191,36 @@ void install(const Options& options) {
     if (!fs::is_directory(distribution / "share/licenses")) throw Error("missing_bundle", "Distribution license notices are missing.");
     fs::create_directory(runtime / "share");
     fs::copy(distribution / "share/licenses", runtime / "share/licenses", fs::copy_options::recursive);
-    fs::path source = options.has("--model-dir") ? fs::absolute(options.get("--model-dir")) : distribution / "models";
-    verify_model_assets(source);
+    fs::path distribution_models = distribution / "models";
+    fs::path source = options.has("--model-dir") ? fs::absolute(options.get("--model-dir")) :
+        fs::is_directory(distribution_models) ? distribution_models : model_cache();
+    if (!fs::is_directory(source)) {
+        if (options.has("--model-dir") || options.has("--no-download"))
+            throw Error("model_missing", "No model files found in " + source.string() +
+                         ". Pass --model-dir pointing at a folder containing config.json, model.safetensors, and tokenizer.json.");
+        fs::create_directories(source);
+    }
+#if defined(__linux__)
+    if (!options.has("--model-dir") && !options.has("--no-download") && source != distribution_models) {
+        const auto& assets = model_assets();
+        const std::string base = "https://huggingface.co/" + assets.at("model").get<std::string>() +
+                                 "/resolve/" + assets.at("revision").get<std::string>() + "/";
+        for (auto it = assets.at("files").begin(); it != assets.at("files").end(); ++it) {
+            const fs::path relative(it.key());
+            if (fs::exists(source / relative)) continue;
+            std::cout << "Downloading " << relative.generic_string() << " into " << source << " ...\n";
+            try {
+                download(base + relative.generic_string(), source / relative, it.value().get<std::string>(),
+                         8ull * 1024 * 1024 * 1024);
+            } catch (const Error& error) {
+                throw Error("download_failed", "Cannot download " + relative.generic_string() + " (" + error.what() +
+                             "). Check the network, or reuse local files with --model-dir instead.");
+            }
+        }
+    }
+#endif
+    bool allow_unpinned = options.has("--model-dir") || source != distribution_models;
+    verify_model_assets(source, true, allow_unpinned);
     for (auto it = model_assets().at("files").begin(); it != model_assets().at("files").end(); ++it) {
         const auto destination = runtime / "models" / it.key();
         fs::create_directories(destination.parent_path());
@@ -204,7 +235,7 @@ void install(const Options& options) {
         {"format", 1}, {"product", "Deckard"}, {"version", app_version}, {"model", model_id}, {"revision", revision},
         {"policy", policy_id}, {"flag_threshold", flag_threshold}, {"experimental", true},
         {"extension_id", id}, {"weights_sha256", packed_sha}, {"tokenizer_sha256", tokenizer_sha},
-        {"source", "verified-coreml-export"}, {"runtime", runtime_id},
+        {"source", native_source}, {"runtime", runtime_id},
         {"model_assets_sha256", model_assets_id()}, {"model_files", model_assets().at("files")},
         {"binary_sha256", sha256(runtime / "bin/deckard")},
         {"threshold_notice", "Experimental score, not a probability; browsing false positives are not independently validated."},
@@ -331,7 +362,7 @@ Removal validate_release(const fs::path& release) {
             ? flag_threshold : 0.9824231167326641) ||
         config.value("experimental", Json()) != true ||
         !config.value("extension_id", Json()).is_string() ||
-        config.value("source", Json()) != (coreml ? "verified-coreml-export" : "verified-packed-export"))
+        config.value("source", Json()) != (coreml ? native_source : packed_source))
         uninstall_conflict("This directory is not a Deckard installation: " + release.string() + ".");
     if (coreml && (config.value("runtime", Json()) != runtime_id ||
         config.value("model_assets_sha256", Json()) != model_assets_id() ||
@@ -409,8 +440,7 @@ void uninstall(const Options& options) {
     validate_prefix(prefix);
     auto setup = setup_metadata(prefix);
     fs::path manifest_dir = (options.has("--manifest-dir") ? fs::absolute(options.get("--manifest-dir")) :
-        setup ? fs::path((*setup)["manifest_dir"].get<std::string>()) :
-        user_home() / "Library/Application Support/Google/Chrome/NativeMessagingHosts").lexically_normal();
+        setup ? fs::path((*setup)["manifest_dir"].get<std::string>()) : default_manifest_dir()).lexically_normal();
     if (manifest_dir != manifest_dir.root_path() && manifest_dir.filename().empty()) manifest_dir = manifest_dir.parent_path();
     if (setup && (*setup)["manifest_dir"] != manifest_dir.string())
         uninstall_conflict("The supplied manifest directory differs from owned setup metadata.");
@@ -542,8 +572,9 @@ void verify(const Options& options) {
     if (!fixtures.is_object() || !fixtures.contains("cases") || !fixtures["cases"].is_array() || fixtures["cases"].empty())
         throw Error("fixtures", "Expected nonempty reference cases.");
     auto started = std::chrono::steady_clock::now();
-    CoreMLGradient model(options.get("--model"),
-        options.has("--cache-dir") ? fs::absolute(options.get("--cache-dir")) : model_cache());
+    std::unique_ptr<ModelBackend> model(create_model_backend(
+        options.get("--model"),
+        options.has("--cache-dir") ? fs::absolute(options.get("--cache-dir")) : model_cache()));
     double load = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
     Json rows = Json::array();
     double logit_error = 0, score_error = 0;
@@ -553,14 +584,14 @@ void verify(const Options& options) {
         auto mask = item.at("feed").at("attention_mask").get<std::vector<std::vector<uint32_t>>>();
         if (ids.size() != 1 || mask.size() != 1) throw Error("fixtures", "Only batch-one fixtures are supported.");
         auto before = std::chrono::steady_clock::now();
-        double value = model.logit(ids[0], mask[0]), score = sigmoid(value);
+        double value = model->logit(ids[0], mask[0]), score = sigmoid(value);
         double elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - before).count();
         double expected = item.at("logit").get<double>();
         logit_error = std::max(logit_error, std::abs(value - expected));
         score_error = std::max(score_error, std::abs(score - sigmoid(expected)));
         const bool same_decision = (score >= flag_threshold) == (sigmoid(expected) >= flag_threshold);
         same_decisions = same_decisions && same_decision;
-        rows.push_back({{"name", item.at("name")}, {"logit", value}, {"score", score},
+        rows.push_back(Json{{"name", item.at("name")}, {"logit", value}, {"score", score},
             {"elapsed_ms", elapsed}, {"same_default_decision", same_decision}});
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
@@ -569,7 +600,7 @@ void verify(const Options& options) {
                    {"max_logit_error", logit_error}, {"max_score_error", score_error}, {"load_ms", load},
                    {"same_default_decisions", same_decisions}, {"score_tolerance", 0.002},
                    {"runtime", runtime_id}, {"scheduling", "default"},
-                   {"compute_units", "cpu_and_neural_engine"}, {"model_assets_sha256", model_assets_id()},
+                   {"compute_units", native_compute_units}, {"model_assets_sha256", model_assets_id()},
                    {"source_weights_sha256", packed_sha},
                    {"fixtures_sha256", sha256(options.get("--fixtures"))}};
     if (options.has("--output")) {
@@ -580,11 +611,12 @@ void verify(const Options& options) {
 }
 void help() {
     std::cout <<
-        "Deckard 0.6.4 - native Gradient/Core ML for Apple Silicon macOS15+\n\n"
-        "deckard install [--extension-id ID] [--replace] [--model-dir DIR]\n"
+"Deckard 0.6.4 - native Gradient/Core ML for Apple Silicon macOS15+\n\n"
+        "deckard install [--extension-id ID] [--replace] [--model-dir DIR] [--no-download]\n"
         "                [--home DIR] [--manifest-dir DIR] [--no-register]\n"
         "                [--extension-dir DIR] [--shell zsh|bash|none] [--no-extension]\n"
         "  Install a self-contained native runtime and Chrome registration.\n"
+        "  Without --model-dir, pinned model files are fetched into the default model cache.\n"
         "  Uses the prebuilt Core ML model and extension from the release bundle by default.\n"
         "  The official extension ID is fixed; --extension-id explicitly overrides it.\n"
         "  --shell defaults to the login SHELL (zsh/bash); none leaves PATH alone.\n\n"

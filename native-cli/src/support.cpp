@@ -1,11 +1,6 @@
 #include "support.hpp"
 #include "model_assets.hpp"
-#include <CommonCrypto/CommonDigest.h>
 #include <curl/curl.h>
-#include <mach-o/dyld.h>
-#include <sys/resource.h>
-#include <pthread.h>
-#include <unistd.h>
 #include <array>
 #include <cerrno>
 #include <chrono>
@@ -16,6 +11,17 @@
 #include <iostream>
 #include <sstream>
 #include <set>
+#if defined(__APPLE__)
+#include <CommonCrypto/CommonDigest.h>
+#include <mach-o/dyld.h>
+#include <sys/resource.h>
+#include <pthread.h>
+#include <unistd.h>
+#elif defined(__linux__)
+#include <openssl/sha.h>
+#include <sys/resource.h>
+#include <unistd.h>
+#endif
 
 namespace aihider {
 namespace {
@@ -72,11 +78,18 @@ size_t receive(char* data, size_t size, size_t count, void* pointer) {
 }
 
 fs::path executable_path() {
+#if defined(__APPLE__)
     uint32_t size = 0;
     _NSGetExecutablePath(nullptr, &size);
     std::vector<char> buffer(size);
     if (_NSGetExecutablePath(buffer.data(), &size)) throw Error("runtime_path", "Cannot locate the executable.");
     return fs::canonical(buffer.data());
+#elif defined(__linux__)
+    std::error_code error;
+    auto resolved = fs::canonical("/proc/self/exe", error);
+    if (error) throw Error("runtime_path", "Cannot locate the executable.");
+    return resolved;
+#endif
 }
 fs::path user_home() {
     const char* home = std::getenv("HOME");
@@ -88,7 +101,18 @@ fs::path default_home() {
     if (override_path && *override_path) return fs::absolute(override_path);
     auto bundled = executable_path().parent_path().parent_path();
     if (fs::is_regular_file(bundled / "install.json")) return bundled;
+#if defined(__APPLE__)
     return user_home() / "Deckard/current";
+#elif defined(__linux__)
+    return user_home() / ".local/share/deckard/current";
+#endif
+}
+fs::path default_manifest_dir() {
+#if defined(__APPLE__)
+    return user_home() / "Library/Application Support/Google/Chrome/NativeMessagingHosts";
+#elif defined(__linux__)
+    return user_home() / ".config/google-chrome/NativeMessagingHosts";
+#endif
 }
 std::string read_text(const fs::path& path, size_t limit) {
     if (!fs::is_regular_file(path) || fs::file_size(path) > limit)
@@ -135,6 +159,7 @@ void write_json(const fs::path& path, const Json& value) {
 std::string sha256(const fs::path& path) {
     std::ifstream stream(path, std::ios::binary);
     if (!stream) throw Error("missing_assets", "Required asset is missing or unreadable.");
+#if defined(__APPLE__)
     CC_SHA256_CTX context;
     CC_SHA256_Init(&context);
     std::array<char, 65536> buffer{};
@@ -146,11 +171,30 @@ std::string sha256(const fs::path& path) {
     unsigned char digest[CC_SHA256_DIGEST_LENGTH];
     CC_SHA256_Final(digest, &context);
     return hex(digest, sizeof(digest));
+#elif defined(__linux__)
+    SHA256_CTX context;
+    SHA256_Init(&context);
+    std::array<char, 65536> buffer{};
+    while (stream) {
+        stream.read(buffer.data(), buffer.size());
+        SHA256_Update(&context, buffer.data(), static_cast<size_t>(stream.gcount()));
+    }
+    if (!stream.eof()) throw Error("asset_read", "Failed while reading an asset.");
+    unsigned char digest[SHA256_DIGEST_LENGTH];
+    SHA256_Final(digest, &context);
+    return hex(digest, sizeof(digest));
+#endif
 }
 std::string text_sha256(const std::string& text) {
+#if defined(__APPLE__)
     unsigned char digest[CC_SHA256_DIGEST_LENGTH];
     CC_SHA256(text.data(), static_cast<CC_LONG>(text.size()), digest);
     return hex(digest, sizeof(digest));
+#elif defined(__linux__)
+    unsigned char digest[SHA256_DIGEST_LENGTH];
+    SHA256(reinterpret_cast<const unsigned char*>(text.data()), text.size(), digest);
+    return hex(digest, sizeof(digest));
+#endif
 }
 void require_hash(const fs::path& path, const std::string& expected) {
     if (expected.size() != 64 || sha256(path) != expected)
@@ -176,7 +220,7 @@ void download(const std::string& url, const fs::path& destination, const std::st
     curl_easy_setopt(handle, CURLOPT_REDIR_PROTOCOLS_STR, "https");
     curl_easy_setopt(handle, CURLOPT_MAXREDIRS, 8L);
     curl_easy_setopt(handle, CURLOPT_CONNECTTIMEOUT, 30L);
-    curl_easy_setopt(handle, CURLOPT_TIMEOUT, 1200L);
+    curl_easy_setopt(handle, CURLOPT_TIMEOUT, 7200L);
     curl_easy_setopt(handle, CURLOPT_FAILONERROR, 1L);
     if (existing) curl_easy_setopt(handle, CURLOPT_RESUME_FROM_LARGE, static_cast<curl_off_t>(existing));
     curl_easy_setopt(handle, CURLOPT_WRITEFUNCTION, receive);
@@ -189,22 +233,39 @@ void download(const std::string& url, const fs::path& destination, const std::st
     fs::rename(partial, destination);
 }
 void background() {
+#if defined(__APPLE__)
     if (setpriority(PRIO_DARWIN_PROCESS, 0, PRIO_DARWIN_BG) != 0 ||
         pthread_set_qos_class_self_np(QOS_CLASS_BACKGROUND, 0) != 0)
         throw Error("scheduling_failed", "Cannot enable background scheduling.");
+#elif defined(__linux__)
+    if (setpriority(PRIO_PROCESS, 0, 10) != 0)
+        throw Error("scheduling_failed", "Cannot enable background scheduling.");
+#endif
 }
 void default_priority() {
+#if defined(__APPLE__)
     if (setpriority(PRIO_DARWIN_PROCESS, 0, 0) != 0 ||
         pthread_set_qos_class_self_np(QOS_CLASS_DEFAULT, 0) != 0)
         throw Error("scheduling_failed", "Cannot enable default-priority inference.");
+#elif defined(__linux__)
+    if (setpriority(PRIO_PROCESS, 0, 0) != 0)
+        throw Error("scheduling_failed", "Cannot enable default-priority inference.");
+#endif
 }
 const Json& model_assets() {
     static const auto assets = Json::parse(model_assets_json);
     return assets;
 }
 std::string model_assets_id() { return model_assets_sha256; }
-fs::path model_cache() { return user_home() / "Library/Caches/Deckard/coreml"; }
-void verify_model_assets(const fs::path& directory, bool verify_hashes) {
+fs::path model_cache() {
+#if defined(__APPLE__)
+    return user_home() / "Library/Caches/Deckard/coreml";
+#elif defined(__linux__)
+    return user_home() / ".cache/deckard/candle";
+#endif
+}
+#if defined(__APPLE__)
+void verify_model_assets(const fs::path& directory, bool verify_hashes, bool allow_unpinned) {
     std::error_code error;
     const auto root = fs::canonical(directory, error);
     if (error) throw Error("missing_assets", "Core ML model assets are missing. Install the Core ML release bundle.");
@@ -226,14 +287,17 @@ void verify_model_assets(const fs::path& directory, bool verify_hashes) {
         if (verify_hashes) require_hash(root / relative, it.value().get<std::string>());
     }
     // Core ML must never consume extra, unpinned files hidden inside the package.
-    for (const auto& entry : fs::recursive_directory_iterator(root / model_assets().at("model_package").get<std::string>())) {
-        const auto relative = entry.path().lexically_relative(root);
-        const auto status = entry.symlink_status();
-        if ((fs::is_directory(status) && directories.count(relative)) ||
-            (fs::is_regular_file(status) && files.contains(relative.generic_string()))) continue;
-        throw Error("asset_mismatch", "The Core ML package contains unexpected assets.");
+    if (!allow_unpinned) {
+        for (const auto& entry : fs::recursive_directory_iterator(root / model_assets().at("model_package").get<std::string>())) {
+            const auto relative = entry.path().lexically_relative(root);
+            const auto status = entry.symlink_status();
+            if ((fs::is_directory(status) && directories.count(relative)) ||
+                (fs::is_regular_file(status) && files.contains(relative.generic_string()))) continue;
+            throw Error("asset_mismatch", "The Core ML package contains unexpected assets.");
+        }
     }
 }
+#endif
 bool extension_id_valid(const std::string& id) {
     return id.size() == 32 && id.find_first_not_of("abcdefghijklmnop") == std::string::npos;
 }
@@ -271,6 +335,7 @@ Json identity() {
             {"policy", policy_id}, {"flag_threshold", flag_threshold}, {"experimental", true},
             {"min_words", min_words}};
 }
+#if defined(__APPLE__)
 Json installed_config(const fs::path& home, bool verify) {
     auto config = read_json(home / "install.json");
     if (!config.is_object() || config.value("format", Json()) != 1 ||
@@ -279,7 +344,7 @@ Json installed_config(const fs::path& home, bool verify) {
         config.value("policy", Json()) != policy_id || config.value("flag_threshold", Json()) != flag_threshold ||
         config.value("experimental", Json()) != true ||
         config.value("runtime", Json()) != runtime_id ||
-        config.value("source", Json()) != "verified-coreml-export" ||
+        config.value("source", Json()) != native_source ||
         config.value("weights_sha256", Json()) != packed_sha ||
         config.value("tokenizer_sha256", Json()) != tokenizer_sha ||
         config.value("model_assets_sha256", Json()) != model_assets_id() ||
@@ -291,4 +356,59 @@ Json installed_config(const fs::path& home, bool verify) {
     verify_model_assets(models, verify);
     return config;
 }
+#elif defined(__linux__)
+void verify_model_assets(const fs::path& directory, bool verify_hashes, bool allow_unpinned) {
+    std::error_code error;
+    const auto root = fs::canonical(directory, error);
+    if (error) throw Error("missing_assets", "The Candle model directory does not exist or is unreadable: " + directory.string() + ".");
+    std::set<fs::path> directories;
+    const auto& files = model_assets().at("files");
+    for (auto it = files.begin(); it != files.end(); ++it) {
+        const fs::path relative(it.key());
+        fs::path current = root;
+        for (const auto& part : relative) {
+            current /= part;
+            const auto status = fs::symlink_status(current);
+            if (status.type() == fs::file_type::not_found)
+                throw Error("missing_assets", "The Candle model asset is missing: " + relative.generic_string() + ".");
+            const bool leaf = current == root / relative;
+            if (leaf ? !fs::is_regular_file(status) : !fs::is_directory(status))
+                throw Error("asset_mismatch", "Model assets must be ordinary files and directories, not links.");
+            if (!leaf) directories.insert(current.lexically_relative(root));
+        }
+        if (verify_hashes) require_hash(root / relative, it.value().get<std::string>());
+    }
+    // The Candle backend reads exactly the pinned files; nothing else must be
+    // hidden inside the model directory.
+    if (!allow_unpinned) {
+        for (const auto& entry : fs::recursive_directory_iterator(root)) {
+            const auto relative = entry.path().lexically_relative(root);
+            const auto status = entry.symlink_status();
+            if ((fs::is_directory(status) && directories.count(relative)) ||
+                (fs::is_regular_file(status) && files.contains(relative.generic_string()))) continue;
+            throw Error("asset_mismatch", "The Candle model directory contains unexpected assets.");
+        }
+    }
+}
+Json installed_config(const fs::path& home, bool verify) {
+    auto config = read_json(home / "install.json");
+    if (!config.is_object() || config.value("format", Json()) != 1 ||
+        config.value("product", Json()) != "Deckard" || config.value("version", Json()) != app_version ||
+        config.value("model", Json()) != model_id || config.value("revision", Json()) != revision ||
+        config.value("policy", Json()) != policy_id || config.value("flag_threshold", Json()) != flag_threshold ||
+        config.value("experimental", Json()) != true ||
+        config.value("runtime", Json()) != runtime_id ||
+        config.value("source", Json()) != native_source ||
+        config.value("weights_sha256", Json()) != packed_sha ||
+        config.value("tokenizer_sha256", Json()) != tokenizer_sha ||
+        config.value("model_assets_sha256", Json()) != model_assets_id() ||
+        config.value("model_files", Json()) != model_assets().at("files"))
+        throw Error("invalid_installation", "Installation metadata is incompatible. Install the Candle release bundle.");
+    const auto models = fs::canonical(home) / "models";
+    if (!fs::is_directory(fs::symlink_status(models)))
+        throw Error("missing_assets", "Model assets are missing or redirected. Run deckard install.");
+    verify_model_assets(models, verify);
+    return config;
+}
+#endif
 }

@@ -118,11 +118,15 @@ void require_plain_path(const fs::path& path, bool directory) {
         if (!path_present(current)) continue;
         auto status = fs::symlink_status(current);
         if (current != absolute || directory) {
-            if (status.type() != fs::file_type::directory) conflict("Setup requires real directories, not redirected paths.");
+            if (status.type() != fs::file_type::directory) {
+                if (status.type() != fs::file_type::symlink ||
+                    fs::status(current).type() != fs::file_type::directory)
+                    conflict("Setup requires a real directory, not a redirected path: " + current.string() + ".");
+            }
         } else {
             struct stat info {};
             if (status.type() != fs::file_type::regular || stat(current.c_str(), &info) || info.st_nlink != 1)
-                conflict("Setup requires private regular files, not symlinks or hard links.");
+                conflict("Setup requires a private regular file, not a symlink or hard link: " + current.string() + ".");
         }
     }
 }
@@ -186,6 +190,11 @@ SetupTransaction::SetupTransaction(const fs::path& prefix, const fs::path& stage
              {"transaction_id", stage_.filename().string()}};
     if (!profile_.empty()) {
         path_command_conflict(prefix_);
+        auto profile_status = fs::symlink_status(profile_);
+        if (profile_status.type() == fs::file_type::symlink ||
+            (profile_status.type() == fs::file_type::regular && fs::hard_link_count(profile_) > 1))
+            conflict("Cannot manage the shell profile " + profile_.string() +
+                     " because it is a symlink or hard link. Pass --shell none to skip shell profile management, and add the deckard bin directory to PATH manually if desired.");
         require_plain_path(profile_, false);
         profile_existed_ = path_present(profile_);
         profile_before_ = profile_existed_ ? read_text(profile_) : "";

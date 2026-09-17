@@ -1,10 +1,16 @@
 (() => {
   "use strict";
+  try {
   if (globalThis.__deckardLocal) return;
   globalThis.__deckardLocal = true;
   const C = globalThis.DeckardCore;
   if (!C || !C.originOf(location.href) || window.top !== window) return;
   const runtime = chrome.runtime;
+  if (typeof crypto.randomUUID !== "function") {
+    if (typeof console !== "undefined")
+      console.warn("Deckard cannot analyze this page: it is not a secure context (https or localhost required).");
+    return;
+  }
   const suffix = crypto.randomUUID().replaceAll("-", "");
   const flagClass = `deckard-marked-${suffix}`;
   const records = new Map();
@@ -38,7 +44,7 @@
   const structuralRecords = new Set();
   let currentURL = location.href;
   let sheet;
-  let status = { state: "idle", analyzed: 0, partial: 0, skipped: 0, marked: 0, limited: false,
+  let status = { state: "idle", analyzed: 0, clear: 0, partial: 0, skipped: 0, marked: 0, limited: false,
     scannedWords: 0, totalWords: 0, usedWords: 0, findings: [], detail: "" };
   const view = window;
   async function request(message) {
@@ -234,6 +240,7 @@
         if (record.block.scale !== "context" && selectedKeys.get(key) !== record.block.text) removeRecord(key);
       }
       status.analyzed = 0;
+      status.clear = 0;
       status.contextAnalyzed = 0;
       status.partial = 0;
       status.scannedWords = 0;
@@ -282,6 +289,7 @@
         status.analyzed++;
         if (result.status === "partial" || result.truncated
           || result.chunks.some(chunk => chunk.words < C.MIN_WORDS)) status.partial++;
+        else if (!C.shouldFlag(result, config)) status.clear++;
         updateStatus();
       }
       if (stopped || id !== runId) return;
@@ -433,7 +441,7 @@
     timer = undefined;
     // Mutations and Off/On share a budget; a new SPA page gets a fresh one.
     if (!reauthorizing) {
-      status = { state: "starting", analyzed: 0, partial: 0, skipped: 0, marked: 0, limited: false,
+      status = { state: "starting", analyzed: 0, clear: 0, partial: 0, skipped: 0, marked: 0, limited: false,
         scannedWords: 0, totalWords: 0, usedWords, findings: [], detail: "" };
     } else {
       status.state = "starting";
@@ -582,4 +590,9 @@
   window.addEventListener("popstate", checkNavigation);
   window.addEventListener("hashchange", checkNavigation);
   void refresh();
+  } catch (error) {
+    // Pages that cannot support the script (restricted origins, missing APIs)
+    // are skipped quietly rather than crashing the active page.
+    if (typeof console !== "undefined") console.debug("Deckard skipped this page:", error);
+  }
 })();
