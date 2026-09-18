@@ -64,6 +64,8 @@ struct Download {
     std::ofstream stream;
     uint64_t bytes = 0;
     uint64_t maximum;
+    std::string label;
+    bool progress_started = false;
 };
 size_t receive(char* data, size_t size, size_t count, void* pointer) {
     auto& state = *static_cast<Download*>(pointer);
@@ -74,6 +76,21 @@ size_t receive(char* data, size_t size, size_t count, void* pointer) {
     if (!state.stream) return 0;
     state.bytes += length;
     return length;
+}
+// curl's progress callback. A model file is often hundreds of MiB and would
+// otherwise transfer with no visible activity, so this repaints a single line
+// ("label: now/total MiB (P%)") in place using a carriage return. Returning
+// nonzero would abort the transfer, hence a constant zero.
+int report_progress(void* pointer, curl_off_t total, curl_off_t now, curl_off_t, curl_off_t) {
+    auto& state = *static_cast<Download*>(pointer);
+    state.progress_started = true;
+    if (total <= 0) return 0;
+    constexpr std::uint64_t mib = 1024 * 1024;
+    unsigned percent = static_cast<unsigned>((static_cast<double>(now) / static_cast<double>(total)) * 100.0);
+    if (percent > 100) percent = 100;
+    std::cout << '\r' << state.label << ": " << static_cast<std::uint64_t>(now) / mib << " / "
+              << static_cast<std::uint64_t>(total) / mib << " MiB (" << percent << "%)" << std::flush;
+    return 0;
 }
 }
 
@@ -210,7 +227,8 @@ void download(const std::string& url, const fs::path& destination, const std::st
         fs::rename(partial, destination);
         return;
     }
-    Download state{std::ofstream(partial, std::ios::binary | std::ios::app), existing, max_bytes};
+    Download state{std::ofstream(partial, std::ios::binary | std::ios::app), existing, max_bytes,
+                   destination.filename().string()};
     if (!state.stream) throw Error("download_write", "Cannot create the download file.");
     CURL* handle = curl_easy_init();
     if (!handle) throw Error("download_init", "Cannot initialize HTTPS downloads.");
@@ -225,8 +243,15 @@ void download(const std::string& url, const fs::path& destination, const std::st
     if (existing) curl_easy_setopt(handle, CURLOPT_RESUME_FROM_LARGE, static_cast<curl_off_t>(existing));
     curl_easy_setopt(handle, CURLOPT_WRITEFUNCTION, receive);
     curl_easy_setopt(handle, CURLOPT_WRITEDATA, &state);
+    // Surface live progress instead of a silent multi-hundred-MiB transfer; the
+    // progress line is terminated below so it does not run into later messages.
+    curl_easy_setopt(handle, CURLOPT_NOPROGRESS, 0L);
+    curl_easy_setopt(handle, CURLOPT_XFERINFOFUNCTION, report_progress);
+    curl_easy_setopt(handle, CURLOPT_XFERINFODATA, &state);
     CURLcode result = curl_easy_perform(handle);
     curl_easy_cleanup(handle);
+    // Close the \r-updating progress line whether the transfer succeeded or not.
+    if (state.progress_started) std::cout << '\n' << std::flush;
     state.stream.close();
     if (result != CURLE_OK || !state.stream) throw Error("download_failed", "HTTPS download failed; no installation activated.");
     require_hash(partial, expected);

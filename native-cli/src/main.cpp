@@ -208,10 +208,14 @@ void install(const Options& options) {
         for (auto it = assets.at("files").begin(); it != assets.at("files").end(); ++it) {
             const fs::path relative(it.key());
             if (fs::exists(source / relative)) continue;
-            std::cout << "Downloading " << relative.generic_string() << " into " << source << " ...\n";
+            // std::cout is fully buffered after sync_with_stdio(false), so a trailing
+            // newline alone would not reach the terminal for minutes. Flush up front
+            // so the user sees that a large file is being fetched.
+            std::cout << "Downloading " << relative.generic_string() << " into " << source << " ..." << std::endl;
             try {
                 download(base + relative.generic_string(), source / relative, it.value().get<std::string>(),
                          8ull * 1024 * 1024 * 1024);
+                std::cout << "Downloaded " << relative.generic_string() << "." << std::endl;
             } catch (const Error& error) {
                 throw Error("download_failed", "Cannot download " + relative.generic_string() + " (" + error.what() +
                              "). Check the network, or reuse local files with --model-dir instead.");
@@ -327,7 +331,9 @@ void install(const Options& options) {
                   << "and select " << prefix / "extension" << ". New installations start On; saved Off settings are preserved.\n"
                   << "After an upgrade, click Reload on the existing Deckard extension.\n";
     if (shell != "none") std::cout << "Open a new terminal to use deckard on PATH.\n";
-    std::cout << "Chrome starts the stdio host on demand; deckard start is not a daemon.\n";
+    // sync_with_stdio(false) leaves stdout fully buffered; end the summary with an
+    // explicit flush so the confirmation is not stranded in the buffer.
+    std::cout << "Chrome starts the stdio host on demand; deckard start is not a daemon." << std::endl;
 }
 bool present(const fs::path& path) {
     return fs::symlink_status(path).type() != fs::file_type::not_found;
