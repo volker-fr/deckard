@@ -60,15 +60,19 @@ file(COPY "${NATIVE_CACHE}/cargo/registry" DESTINATION "${BUILD_CARGO_HOME}")
 set(RUST_TARGET "${CMAKE_CURRENT_BINARY_DIR}/rust")
 string(ASCII 31 RUST_FLAG_SEPARATOR)
 set(RUST_PATH_FLAGS "--remap-path-prefix=${AI_HIDER_ROOT}=/deckard-source${RUST_FLAG_SEPARATOR}--remap-path-prefix=${NATIVE_CACHE}=/deckard-sdk")
+set(tokenizer_env "CARGO_HOME=${BUILD_CARGO_HOME}" "RUSTUP_HOME=${NATIVE_CACHE}/rustup")
+if(APPLE)
+  list(APPEND tokenizer_env "MACOSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET}")
+endif()
+list(APPEND tokenizer_env "RUSTC=${RUSTC}" "CARGO_ENCODED_RUSTFLAGS=${RUST_PATH_FLAGS}")
+if(RUST_TOOLCHAIN)
+  list(APPEND tokenizer_env "RUSTUP_TOOLCHAIN=1.90.0")
+endif()
+list(APPEND tokenizer_env "CARGO_TARGET_DIR=${RUST_TARGET}" "CARGO_BUILD_JOBS=2")
 add_custom_command(
   OUTPUT "${RUST_TARGET}/release/libai_hider_tokenizer.a"
   COMMAND "${CMAKE_COMMAND}" -E env
-    "CARGO_HOME=${BUILD_CARGO_HOME}" "RUSTUP_HOME=${NATIVE_CACHE}/rustup"
-    $<$<BOOL:${APPLE}>:"MACOSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET}">
-    "RUSTC=${RUSTC}"
-    "CARGO_ENCODED_RUSTFLAGS=${RUST_PATH_FLAGS}"
-    $<$<BOOL:${RUST_TOOLCHAIN}>:"RUSTUP_TOOLCHAIN=1.90.0">
-    "CARGO_TARGET_DIR=${RUST_TARGET}" "CARGO_BUILD_JOBS=2"
+    ${tokenizer_env}
     "${CARGO}" build --release --locked --offline --manifest-path "${CMAKE_CURRENT_SOURCE_DIR}/tokenizer/Cargo.toml"
   DEPENDS tokenizer/Cargo.toml tokenizer/Cargo.lock tokenizer/src/lib.rs
   VERBATIM)
@@ -97,18 +101,21 @@ if(APPLE)
 elseif(UNIX AND NOT APPLE)
   set(CANDLE_SRC "${CMAKE_CURRENT_SOURCE_DIR}/candle")
   set(CANDLE_TARGET "${CMAKE_CURRENT_BINARY_DIR}/candle-rust")
+  set(candle_env "CARGO_HOME=${BUILD_CARGO_HOME}" "RUSTUP_HOME=${NATIVE_CACHE}/rustup")
+  list(APPEND candle_env "RUSTC=${RUSTC}" "CARGO_ENCODED_RUSTFLAGS=${RUST_PATH_FLAGS}")
+  if(RUST_TOOLCHAIN)
+    list(APPEND candle_env "RUSTUP_TOOLCHAIN=1.90.0")
+  endif()
+  list(APPEND candle_env "CARGO_TARGET_DIR=${CANDLE_TARGET}" "CARGO_BUILD_JOBS=2")
   add_custom_command(
     OUTPUT "${CANDLE_TARGET}/release/libai_hider_candle.a"
     COMMAND "${CMAKE_COMMAND}" -E env
-      "CARGO_HOME=${BUILD_CARGO_HOME}" "RUSTUP_HOME=${NATIVE_CACHE}/rustup"
-      "RUSTC=${RUSTC}"
-      "CARGO_ENCODED_RUSTFLAGS=${RUST_PATH_FLAGS}"
-      $<$<BOOL:${RUST_TOOLCHAIN}>:"RUSTUP_TOOLCHAIN=1.90.0">
-      "CARGO_TARGET_DIR=${CANDLE_TARGET}" "CARGO_BUILD_JOBS=2"
+      ${candle_env}
       "${CARGO}" build --release --locked --offline --manifest-path "${CANDLE_SRC}/Cargo.toml"
     DEPENDS "${CANDLE_SRC}/Cargo.toml" "${CANDLE_SRC}/Cargo.lock" "${CANDLE_SRC}/src/lib.rs"
     VERBATIM)
   add_custom_target(candle_build DEPENDS "${CANDLE_TARGET}/release/libai_hider_candle.a")
+  add_dependencies(candle_build tokenizer_build)
   add_library(candle_native STATIC IMPORTED)
   set_target_properties(candle_native PROPERTIES IMPORTED_LOCATION "${CANDLE_TARGET}/release/libai_hider_candle.a")
   add_dependencies(candle_native candle_build)
