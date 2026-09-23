@@ -13,6 +13,10 @@ constexpr std::uint32_t max_len = 512;
 using i32_t = std::int32_t;
 constexpr i32_t code_ok = 0, code_invalid = 1, code_assets = 2, code_load = 3,
     code_forward = 4, code_nonfinite = 5;
+}  // namespace
+// CandleLoader is a member type of CandleGradient (external linkage), so it must
+// not live in an anonymous namespace: internal-linkage subobjects are an ODR
+// hazard if this header is ever included in more than one translation unit.
 class CandleLoader {
  public:
   explicit CandleLoader(const fs::path& model_directory)
@@ -27,7 +31,6 @@ class CandleLoader {
  private:
   std::string config_path_, weights_path_;
 };
-}  // namespace
 
 // Shared with the Rust ai_hider_candle staticlib (native-cli/candle/src/lib.rs).
 // The attention mask crosses the boundary as f32 in lockstep with the Core ML

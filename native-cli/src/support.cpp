@@ -18,7 +18,7 @@
 #include <pthread.h>
 #include <unistd.h>
 #elif defined(__linux__)
-#include <openssl/sha.h>
+#include <openssl/evp.h>
 #include <sys/resource.h>
 #include <unistd.h>
 #endif
@@ -189,17 +189,27 @@ std::string sha256(const fs::path& path) {
     CC_SHA256_Final(digest, &context);
     return hex(digest, sizeof(digest));
 #elif defined(__linux__)
-    SHA256_CTX context;
-    SHA256_Init(&context);
+    // OpenSSL 3.x deprecates the raw SHA256_* entry points; the EVP layer is
+    // supported on every OpenSSL release and yields the same digest.
+    EVP_MD_CTX* context = EVP_MD_CTX_new();
+    if (!context || EVP_DigestInit_ex(context, EVP_sha256(), nullptr) != 1) {
+        if (context) EVP_MD_CTX_free(context);
+        throw Error("digest_init", "Cannot initialize the SHA-256 context.");
+    }
     std::array<char, 65536> buffer{};
     while (stream) {
         stream.read(buffer.data(), buffer.size());
-        SHA256_Update(&context, buffer.data(), static_cast<size_t>(stream.gcount()));
+        if (EVP_DigestUpdate(context, buffer.data(), static_cast<size_t>(stream.gcount())) != 1) {
+            EVP_MD_CTX_free(context);
+            throw Error("asset_read", "Failed while hashing an asset.");
+        }
     }
-    if (!stream.eof()) throw Error("asset_read", "Failed while reading an asset.");
-    unsigned char digest[SHA256_DIGEST_LENGTH];
-    SHA256_Final(digest, &context);
-    return hex(digest, sizeof(digest));
+    unsigned char digest[EVP_MAX_MD_SIZE];
+    unsigned int digest_len = 0;
+    const bool ok = stream.eof() && EVP_DigestFinal_ex(context, digest, &digest_len) == 1;
+    EVP_MD_CTX_free(context);
+    if (!ok) throw Error("asset_read", "Failed while reading an asset.");
+    return hex(digest, digest_len);
 #endif
 }
 std::string text_sha256(const std::string& text) {
@@ -208,9 +218,17 @@ std::string text_sha256(const std::string& text) {
     CC_SHA256(text.data(), static_cast<CC_LONG>(text.size()), digest);
     return hex(digest, sizeof(digest));
 #elif defined(__linux__)
-    unsigned char digest[SHA256_DIGEST_LENGTH];
-    SHA256(reinterpret_cast<const unsigned char*>(text.data()), text.size(), digest);
-    return hex(digest, sizeof(digest));
+    EVP_MD_CTX* context = EVP_MD_CTX_new();
+    unsigned char digest[EVP_MAX_MD_SIZE];
+    unsigned int digest_len = 0;
+    if (!context || EVP_DigestInit_ex(context, EVP_sha256(), nullptr) != 1 ||
+        EVP_DigestUpdate(context, reinterpret_cast<const unsigned char*>(text.data()), text.size()) != 1 ||
+        EVP_DigestFinal_ex(context, digest, &digest_len) != 1) {
+        if (context) EVP_MD_CTX_free(context);
+        throw Error("digest_failed", "Cannot compute the SHA-256 digest.");
+    }
+    EVP_MD_CTX_free(context);
+    return hex(digest, digest_len);
 #endif
 }
 void require_hash(const fs::path& path, const std::string& expected) {
