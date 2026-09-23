@@ -13,6 +13,72 @@ set(CMAKE_OBJCXX_STANDARD 20)
 set(CMAKE_OBJCXX_STANDARD_REQUIRED ON)
 set(CMAKE_OSX_DEPLOYMENT_TARGET "15.0")
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/bin")
+
+# -----------------------------------------------------------------------------
+# Linux CUDA backend (always ON)
+# The Candle GPU backend on Linux is compiled with nvcc, part of the NVIDIA
+# CUDA toolkit that is NOT installed system-wide on this machine. We therefore
+# compile the CUDA candle static library inside a throwaway container (no
+# Dockerfile), using the NVIDIA CUDA devel image as the compiler host. CMake
+# auto-detects the engine (docker, then podman); a Linux build fails without
+# either of them.
+#
+# CUDA Compute Capability 75 (Turing):
+#  1. Backward compatibility: natively targets entry-level and workstation
+#     GPUs such as the NVIDIA T1000, T4 and RTX 20-series (TU117/Turing).
+#  2. Latest minimum toolchain baseline: CUDA 12+ removed support for
+#     Maxwell/Kepler (<6.0) and deprecated Pascal (6.x). Compute 75 is the
+#     lowest baseline modern toolchains accept without throwing compilation
+#     errors in candle-kernels.
+#  3. Forward compatibility via driver JIT: PTX generated for Compute 75 is
+#     automatically forward-compiled by the NVIDIA driver JIT at runtime on
+#     newer architectures (Ampere 8.0/8.6, Ada Lovelace 8.9, Hopper 9.0,
+#     Blackwell 10.0).
+#
+# The container build is the equivalent of running (from the repository root):
+#
+#   docker run --rm \
+#     -e CUDA_COMPUTE_CAP=75 \
+#     -e CUDARC_CUDA_VERSION=11080 \
+#     -e CARGO_TARGET_DIR=/usr/src/app/native-cli/build/candle-cuda \
+#     -e RUSTUP_HOME=/usr/src/app/cache/docker-rustup \
+#     -e CARGO_HOME=/usr/src/app/cache/docker-cargo \
+#     -v "$(pwd)":/usr/src/app \
+#     -w /usr/src/app \
+#     docker.io/nvidia/cuda:11.8.0-devel-ubuntu22.04 \
+#     bash -lc 'apt-get update && apt-get install -y --no-install-recommends \
+#       curl build-essential pkg-config libssl-dev ca-certificates && \
+#       if [ ! -x "$CARGO_HOME/bin/cargo" ]; then \
+#         curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
+#           --no-modify-path; fi && \
+#       export PATH="$CARGO_HOME/bin:$PATH" && \
+#       cargo build --release --locked --features cuda \
+#         --manifest-path native-cli/candle/Cargo.toml && \
+#       mkdir -p native-cli/build/candle-cuda/lib && \
+#       cp -a /usr/local/cuda/lib64/libcublas.so* /usr/local/cuda/lib64/libcublasLt.so* \
+#         /usr/local/cuda/lib64/libcurand.so* /usr/local/cuda/lib64/libcudart.so* \
+#         /usr/local/cuda/lib64/libnvrtc.so* \
+#         native-cli/build/candle-cuda/lib/ && \
+#       cp -a "$(find native-cli/build/candle-cuda/release/build \
+#         -type f -name libmoe.a | head -n1)" native-cli/build/candle-cuda/lib/'
+#
+# (replacing `docker` with `podman` if that is the installed engine). The
+# cache/docker-rustup and cache/docker-cargo mounts persist the toolchain and
+# the crates.io download cache across builds, so dependencies are downloaded
+# only once. CUDARC_CUDA_VERSION selects cudarc's CUDA bindings without a host
+# nvcc and must match the devel image (CUDA 11.8 -> 11080). The same container
+# step copies the CUDA runtime libraries (cudart/cublas/cublasLt/curand/nvrtc)
+# into native-cli/build/candle-cuda/lib for runtime dlopen and the candle-kernels
+# libmoe.a archive for linking. cudarc runs in dynamic-loading mode (see
+# native-cli/candle/Cargo.toml and the vendored candle-core patch), so deckard
+# itself links no CUDA library and starts without an NVIDIA driver: CUDA is used
+# only when the driver is reachable, otherwise the model runs on CPU.
+# -----------------------------------------------------------------------------
+
+set(DECKARD_CUDA_HOME "/usr/local/cuda" CACHE PATH "CUDA toolkit root whose lib64 is added to the deckard runtime search path (libcublas/libcudart/driver are dlopened).")
+set(DECKARD_CUDA_COMPUTE_CAP "75" CACHE STRING "CUDA compute capability targeted by the containerized candle-kernels build (see the 75 rationale above).")
+set(DECKARD_CUDA_IMAGE "docker.io/nvidia/cuda:11.8.0-devel-ubuntu22.04" CACHE STRING "Fully-qualified CUDA devel container image used to compile the candle CUDA backend (podman requires the registry prefix). CUDA 11.8 is used because the build targets compute capability 75: candle-kernels 0.11.0 supplies its own __hmax_nan/__hmin_nan shims for sm<80, and CUDA 12 headers define those functions unconditionally, so any CUDA 12.x toolkit fails to compile the kernel crate for sm_75.")
+set(DECKARD_CUDARC_CUDA_VERSION "11080" CACHE STRING "cudarc CUDA-version selector; must match DECKARD_CUDA_IMAGE (CUDA 11.8 -> 11080).")
 get_filename_component(AI_HIDER_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
 if(DEFINED ENV{NATIVE_CACHE})
   set(NATIVE_CACHE "$ENV{NATIVE_CACHE}" CACHE PATH "Native dependency cache")
@@ -99,33 +165,70 @@ if(APPLE)
   target_link_libraries(deckard PRIVATE tokenizer_native ai_hider_json "-lcurl" "-framework Security"
     "-framework CoreFoundation" "-framework Foundation" "-framework CoreML")
 elseif(UNIX AND NOT APPLE)
-  set(CANDLE_SRC "${CMAKE_CURRENT_SOURCE_DIR}/candle")
-  set(CANDLE_TARGET "${CMAKE_CURRENT_BINARY_DIR}/candle-rust")
-  set(candle_env "CARGO_HOME=${BUILD_CARGO_HOME}" "RUSTUP_HOME=${NATIVE_CACHE}/rustup")
-  list(APPEND candle_env "RUSTC=${RUSTC}" "CARGO_ENCODED_RUSTFLAGS=${RUST_PATH_FLAGS}")
-  if(RUST_TOOLCHAIN)
-    list(APPEND candle_env "RUSTUP_TOOLCHAIN=1.90.0")
+  # A container engine is mandatory: the Candle CUDA backend is compiled with
+  # nvcc inside a container (see the CUDA comment above); no host nvcc exists.
+  find_program(CONTAINER_ENGINE docker)
+  if(NOT CONTAINER_ENGINE)
+    find_program(CONTAINER_ENGINE podman)
+    if(NOT CONTAINER_ENGINE)
+      message(FATAL_ERROR "Linux builds require Docker or Podman to run nvcc in a "
+        "container for the Candle CUDA backend, and neither was found on PATH. "
+        "Install either engine and reconfigure.")
+    endif()
   endif()
-  list(APPEND candle_env "CARGO_TARGET_DIR=${CANDLE_TARGET}" "CARGO_BUILD_JOBS=2")
+  set(CANDLE_SRC "${CMAKE_CURRENT_SOURCE_DIR}/candle")
+  # Fixed host location, matching the container's CARGO_TARGET_DIR mount
+  # (/usr/src/app/native-cli/build/candle-cuda): the container writes the
+  # static library here regardless of the CMake build directory.
+  set(CANDLE_CUDA_DIR "${AI_HIDER_ROOT}/native-cli/build/candle-cuda")
+  set(CANDLE_CUDA_A "${CANDLE_CUDA_DIR}/release/libai_hider_candle.a")
+  file(MAKE_DIRECTORY "${AI_HIDER_ROOT}/cache/docker-cargo" "${AI_HIDER_ROOT}/cache/docker-rustup")
+  set(CUDA_CONTAINER_SCRIPT
+    "apt-get update && apt-get install -y --no-install-recommends curl build-essential pkg-config libssl-dev ca-certificates && if [ ! -x \"\$CARGO_HOME/bin/cargo\" ]; then curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path; fi && export PATH=\"\$CARGO_HOME/bin:\$PATH\" && cargo build --release --locked --features cuda --manifest-path native-cli/candle/Cargo.toml && mkdir -p native-cli/build/candle-cuda/lib && cp -a /usr/local/cuda/lib64/libcublas.so* /usr/local/cuda/lib64/libcublasLt.so* /usr/local/cuda/lib64/libcurand.so* /usr/local/cuda/lib64/libcudart.so* /usr/local/cuda/lib64/libnvrtc.so* native-cli/build/candle-cuda/lib/ && cp -a \"\$(find native-cli/build/candle-cuda/release/build -type f -name libmoe.a | head -n1)\" native-cli/build/candle-cuda/lib/")
   add_custom_command(
-    OUTPUT "${CANDLE_TARGET}/release/libai_hider_candle.a"
-    COMMAND "${CMAKE_COMMAND}" -E env
-      ${candle_env}
-      "${CARGO}" build --release --locked --offline --manifest-path "${CANDLE_SRC}/Cargo.toml"
+    OUTPUT "${CANDLE_CUDA_A}"
+    COMMAND "${CONTAINER_ENGINE}" run --rm
+      -e CUDA_COMPUTE_CAP=${DECKARD_CUDA_COMPUTE_CAP}
+      -e CUDARC_CUDA_VERSION=${DECKARD_CUDARC_CUDA_VERSION}
+      -e CARGO_TARGET_DIR=/usr/src/app/native-cli/build/candle-cuda
+      -e RUSTUP_HOME=/usr/src/app/cache/docker-rustup
+      -e CARGO_HOME=/usr/src/app/cache/docker-cargo
+      -v "${AI_HIDER_ROOT}:/usr/src/app"
+      -w /usr/src/app
+      "${DECKARD_CUDA_IMAGE}"
+      bash -lc "${CUDA_CONTAINER_SCRIPT}"
     DEPENDS "${CANDLE_SRC}/Cargo.toml" "${CANDLE_SRC}/Cargo.lock" "${CANDLE_SRC}/src/lib.rs"
     VERBATIM)
-  add_custom_target(candle_build DEPENDS "${CANDLE_TARGET}/release/libai_hider_candle.a")
+  add_custom_target(candle_build DEPENDS "${CANDLE_CUDA_A}")
   add_dependencies(candle_build tokenizer_build)
   add_library(candle_native STATIC IMPORTED)
-  set_target_properties(candle_native PROPERTIES IMPORTED_LOCATION "${CANDLE_TARGET}/release/libai_hider_candle.a")
+  set_target_properties(candle_native PROPERTIES IMPORTED_LOCATION "${CANDLE_CUDA_A}")
   add_dependencies(candle_native candle_build)
   add_executable(deckard src/main.cpp src/gradient_backend.cpp src/tokenizer.cpp src/support.cpp src/host.cpp src/setup.cpp)
   target_include_directories(deckard PRIVATE src "${CMAKE_CURRENT_BINARY_DIR}/generated")
   target_compile_options(deckard PRIVATE -Wall -Wextra
     "-ffile-prefix-map=${AI_HIDER_ROOT}=/deckard-source"
     "-ffile-prefix-map=${NATIVE_CACHE}=/deckard-sdk")
+  if(EXISTS "${CANDLE_CUDA_DIR}/lib")
+    target_link_directories(deckard PRIVATE "${CANDLE_CUDA_DIR}/lib")
+    set_target_properties(deckard PROPERTIES
+      BUILD_RPATH "${CANDLE_CUDA_DIR}/lib"
+      INSTALL_RPATH "${CANDLE_CUDA_DIR}/lib")
+  endif()
+  if(EXISTS "${DECKARD_CUDA_HOME}/lib64")
+    target_link_directories(deckard PRIVATE "${DECKARD_CUDA_HOME}/lib64")
+    set_target_properties(deckard PROPERTIES
+      BUILD_RPATH "${DECKARD_CUDA_HOME}/lib64;${CANDLE_CUDA_DIR}/lib"
+      INSTALL_RPATH "${DECKARD_CUDA_HOME}/lib64;${CANDLE_CUDA_DIR}/lib")
+  endif()
+  # libmoe.a is the candle-kernels static archive (nvcc-compiled mm kernels).
+  # Its host-side stubs call the cudart API (__cudaRegisterFatBinaryEnd, ...),
+  # so -lcudart is required to link. All other CUDA libraries are dlopened by
+  # cudarc at runtime; -lmoe must follow the candle static archive because a
+  # static archive only satisfies references that already appeared earlier in
+  # the link order.
   target_link_libraries(deckard PRIVATE tokenizer_native candle_native ai_hider_json
-    "${CMAKE_DL_LIBS}" "-lcurl" "-lssl" "-lcrypto")
+    "${CMAKE_DL_LIBS}" "-lcurl" "-lssl" "-lcrypto" "-lcudart" "-lmoe")
 else()
   message(FATAL_ERROR "Deckard supports Apple silicon and Linux only.")
 endif()

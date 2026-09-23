@@ -115,18 +115,37 @@ unsafe fn scalar(out: *mut f64, value: f64) -> Result<(), i32> {
     Ok(())
 }
 
+fn try_load(device: &Device, config: &Config, weights_path: &str) -> Result<Box<Handle>, i32> {
+    // SAFETY: The mmap'd safetensors wrap the file for the lifetime of the model.
+    let vb = unsafe {
+        VarBuilder::from_mmaped_safetensors(&[Path::new(weights_path)], DType::F32, device)
+            .map_err(|_| ASSETS)?
+    };
+    let model = DebertaV2SeqClassificationModel::load(vb.pp("deberta"), config, None)
+        .map_err(|_| LOAD)?;
+    Ok(Box::new(Handle {
+        model,
+        device: device.clone(),
+    }))
+}
+
 fn load(config_path: String, weights_path: String) -> Result<Box<Handle>, i32> {
     let config_text = std::fs::read(Path::new(&config_path)).map_err(|_| ASSETS)?;
     let config: Config = serde_json::from_slice(&config_text).map_err(|_| ASSETS)?;
-    let device = Device::Cpu;
-    // SAFETY: The mmap'd safetensors wrap the file for the lifetime of the model.
-    let vb = unsafe {
-        VarBuilder::from_mmaped_safetensors(&[Path::new(&weights_path)], DType::F32, &device)
-            .map_err(|_| ASSETS)?
-    };
-    let model = DebertaV2SeqClassificationModel::load(vb.pp("deberta"), &config, None)
-        .map_err(|_| LOAD)?;
-    Ok(Box::new(Handle { model, device }))
+    // Prefer CUDA when the binary was built with it and a GPU/driver is
+    // present; fall back to CPU if CUDA init or the CUDA model load fails.
+    // cudarc dlopens the driver, so probe availability before initializing.
+    #[cfg(feature = "cuda")]
+    if unsafe { cudarc::driver::sys::is_culib_present() } {
+        if let Ok(device) = Device::new_cuda(0) {
+            if !device.is_cpu() {
+                if let Ok(handle) = try_load(&device, &config, &weights_path) {
+                    return Ok(handle);
+                }
+            }
+        }
+    }
+    try_load(&Device::Cpu, &config, &weights_path)
 }
 
 fn logit(handle: &Handle, ids: Vec<u32>, mask: Vec<f32>) -> Result<f64, i32> {
