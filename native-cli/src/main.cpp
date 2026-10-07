@@ -3,6 +3,8 @@
 #include "gradient_backend.hpp"
 #include "tokenizer.hpp"
 #include "setup.hpp"
+#include "onnx_install.hpp"
+#include "system_check.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -32,7 +34,7 @@ Options options(int argc, char** argv, int start) {
     const std::set<std::string> values{"--home", "--extension-id", "--manifest-dir", "--model-dir",
                                       "--file", "--model", "--fixtures", "--output", "--source",
                                       "--extension-dir", "--shell", "--cache-dir"};
-    const std::set<std::string> flags{"--replace", "--no-register", "--no-extension"};
+    const std::set<std::string> flags{"--replace", "--no-register", "--no-extension", "--onnx", "--candle"};
     Options result;
     for (int i = start; i < argc; ++i) {
         std::string key = argv[i];
@@ -44,6 +46,17 @@ Options options(int argc, char** argv, int start) {
         else throw Error("arguments", "Unknown option: " + key);
     }
     return result;
+}
+// Mutually exclusive backend override; defaults to automatic selection, which
+// resolves at model-open time: the ONNX Runtime when model.onnx is present
+// (with Intel GPU acceleration when usable), otherwise the Candle runtime.
+Backend backend_for(const Options& options) {
+    if (options.has("--onnx")) {
+        if (options.has("--candle")) throw Error("arguments", "Choose either --onnx or --candle.");
+        return Backend::Onnx;
+    }
+    if (options.has("--candle")) return Backend::Candle;
+    return Backend::Auto;
 }
 void allow_options(const Options& options, const std::set<std::string>& allowed) {
     for (const auto& item : options.values)
@@ -222,6 +235,13 @@ void install(const Options& options) {
             }
         }
     }
+    // The ONNX Runtime path is automatic: generate the pinned model.onnx when
+    // it is missing (never fatal - without it the Candle runtime is used).
+    // Vendor GPU drivers are expected on the system, never installed by
+    // Deckard; whether an Intel OpenCL stack or CUDA driver is present (and
+    // usable) is checked at runtime and reported by `deckard check-system`.
+    if (!options.has("--model-dir") && !options.has("--no-download") && source != distribution_models)
+        prepare_onnx_model(source);
 #endif
     bool allow_unpinned = options.has("--model-dir") || source != distribution_models;
     verify_model_assets(source, true, allow_unpinned);
@@ -230,6 +250,8 @@ void install(const Options& options) {
         fs::create_directories(destination.parent_path());
         copy_checked(source / it.key(), destination);
     }
+    if (fs::is_regular_file(source / "model.onnx"))
+        copy_checked(source / "model.onnx", runtime / "models/model.onnx");
     Tokenizer tokenizer(runtime / "models/tokenizer.json");
     auto probe = tokenizer.wrap(tokenizer.encode("Native Gradient installation."));
     if (probe.size() < 3 || probe.front() != 1 || probe.back() != 2)
@@ -244,6 +266,8 @@ void install(const Options& options) {
         {"binary_sha256", sha256(runtime / "bin/deckard")},
         {"threshold_notice", "Experimental score, not a probability; browsing false positives are not independently validated."},
     };
+    if (fs::is_regular_file(runtime / "models/model.onnx"))
+        config["onnx_sha256"] = sha256(runtime / "models/model.onnx");
     config["license_files"] = Json::array();
     config["license_sha256"] = Json::object();
     for (const auto& entry : fs::recursive_directory_iterator(runtime / "share/licenses"))
@@ -402,6 +426,8 @@ Removal validate_release(const fs::path& release) {
             "models/packed.safetensors", "models/tokenizer.json"});
         removal.directories.insert("lib");
     }
+    // Every release may carry the generated ONNX Runtime asset.
+    removal.files.insert("models/model.onnx");
     if (config.contains("license_files")) {
         if (!config["license_files"].is_array())
             uninstall_conflict("Invalid license inventory: " + release.string() + ".");
@@ -568,9 +594,11 @@ void uninstall(const Options& options) {
               << "Reload Chrome to close any running host. Other extensions and shell settings are untouched.\n";
 }
 void verify(const Options& options) {
-    allow_options(options, {"--model", "--fixtures", "--output", "--cache-dir"});
-    if (!options.has("--model") || !options.has("--fixtures"))
-        throw Error("arguments", "verify requires --model and --fixtures.");
+    allow_options(options, {"--model", "--fixtures", "--output", "--cache-dir", "--onnx", "--candle"});
+    if (!options.has("--fixtures"))
+        throw Error("arguments", "verify requires --fixtures.");
+    // Without --model, verify the installed model cache.
+    const std::string model_dir = options.has("--model") ? options.get("--model") : model_cache().string();
     if (options.has("--output") && path_present(options.get("--output")))
         throw Error("output_exists", "Preserve the existing verification receipt.");
     default_priority();
@@ -579,8 +607,9 @@ void verify(const Options& options) {
         throw Error("fixtures", "Expected nonempty reference cases.");
     auto started = std::chrono::steady_clock::now();
     std::unique_ptr<ModelBackend> model(create_model_backend(
-        options.get("--model"),
-        options.has("--cache-dir") ? fs::absolute(options.get("--cache-dir")) : model_cache()));
+        model_dir,
+        options.has("--cache-dir") ? fs::absolute(options.get("--cache-dir")) : model_cache(),
+        backend_for(options)));
     double load = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
     Json rows = Json::array();
     double logit_error = 0, score_error = 0;
@@ -602,12 +631,15 @@ void verify(const Options& options) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
     bool passed = score_error <= 0.002 && same_decisions;
+    const auto runtime = resolve_backend(model_dir, backend_for(options)) == Backend::Onnx
+        ? "native-onnx" : runtime_id;
     Json result = {{"status", passed ? "complete" : "failed"}, {"cases", rows},
                    {"max_logit_error", logit_error}, {"max_score_error", score_error}, {"load_ms", load},
                    {"same_default_decisions", same_decisions}, {"score_tolerance", 0.002},
-                   {"runtime", runtime_id}, {"scheduling", "default"},
+                   {"runtime", runtime}, {"scheduling", "default"},
                    {"compute_units", native_compute_units}, {"model_assets_sha256", model_assets_id()},
                    {"source_weights_sha256", packed_sha},
+                   {"device", model->device()},
                    {"fixtures_sha256", sha256(options.get("--fixtures"))}};
     if (options.has("--output")) {
         write_json(options.get("--output"), result);
@@ -631,13 +663,20 @@ void help() {
         "  --home is the install prefix, not current or a release directory.\n"
         "  Retains unknown files, caches, and the installation lock. Refuses foreign installations.\n"
         "  Removes owned PATH block and extension files; Chrome Remove is manual.\n\n"
-        "deckard start [--home DIR]\n"
+        "deckard start [--home DIR] [--onnx | --candle]\n"
         "  Serve Chrome native messaging on stdin/stdout; Chrome normally launches this.\n"
-        "  This is not an HTTP daemon and should not be backgrounded manually.\n\n"
+        "  This is not an HTTP daemon and should not be backgrounded manually.\n"
+        "  Backends are selected automatically: model.onnx uses the ONNX Runtime (with\n"
+        "  Intel GPU acceleration when usable), otherwise the Candle runtime. --onnx and\n"
+        "  --candle force a specific backend.\n\n"
         "deckard status [--home DIR]\n"
-        "deckard scan [--home DIR] [--file FILE|-]\n"
+        "deckard scan [--home DIR] [--file FILE|-] [--onnx | --candle]\n"
         "  Score UTF-8 text from a file or stdin and print JSON; no page text is logged.\n\n"
-        "deckard verify --model DIR --fixtures FILE [--output FILE] [--cache-dir DIR]\n"
+        "deckard verify --fixtures FILE [--model DIR] [--output FILE] [--cache-dir DIR] [--onnx | --candle]\n"
+        "deckard check-system\n"
+        "  Print host capability report: embedded runtimes, Intel OpenCL/CUDA probes, GPU\n"
+        "  devices the runtime would actually use, model assets, and actionable help when a\n"
+        "  dependency (e.g. the OpenCL loader) or an expected Intel GPU is missing.\n\n"
         "deckard self-test\n";
 }
 }
@@ -664,14 +703,14 @@ int main(int argc, char** argv) {
         if (command == "install") install(args);
         else if (command == "uninstall") uninstall(args);
         else if (command == "start") {
-            allow_options(args, {"--home"});
-            return serve(home_for(args));
+            allow_options(args, {"--home", "--onnx", "--candle"});
+            return serve(home_for(args), backend_for(args));
         } else if (command == "status") {
             allow_options(args, {"--home"});
             auto config = installed_config(home_for(args), true);
             std::cout << Json{{"status", "installed"}, {"home", home_for(args).string()}, {"installation", config}}.dump(2) << '\n';
         } else if (command == "scan") {
-            allow_options(args, {"--home", "--file"});
+            allow_options(args, {"--home", "--file", "--onnx", "--candle"});
             default_priority();
             std::string text;
             if (args.get("--file", "-") == "-") {
@@ -682,10 +721,13 @@ int main(int argc, char** argv) {
                     if (text.size() > 80000) throw Error("invalid_text", "Text exceeds the byte limit.");
                 }
             } else text = read_text(args.get("--file"), 80000);
-            Analyzer analyzer(home_for(args));
+            Analyzer analyzer(home_for(args), backend_for(args));
             std::cout << analyzer.analyze(text).dump(2) << '\n';
         } else if (command == "verify") verify(args);
-        else if (command == "self-test") {
+        else if (command == "check-system") {
+            allow_options(args, {});
+            std::cout << system_check().dump(2) << '\n';
+        } else if (command == "self-test") {
             allow_options(args, {});
             self_test();
             std::cout << "Native self-test passed.\n";

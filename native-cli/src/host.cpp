@@ -1,5 +1,6 @@
 #include "host.hpp"
 #include "gradient_backend.hpp"
+#include "system_check.hpp"
 #include "tokenizer.hpp"
 #include <algorithm>
 #include <chrono>
@@ -25,6 +26,7 @@ Json failure(const Json& id, const std::string& code, const std::string& message
 }
 struct Analyzer::Impl {
     fs::path home;
+    Backend backend;
     std::unique_ptr<Tokenizer> tokenizer;
     std::unique_ptr<ModelBackend> model;
     std::list<std::pair<std::string, Json>> cache;
@@ -36,7 +38,11 @@ struct Analyzer::Impl {
         tokenizer = std::make_unique<Tokenizer>(path);
     }
 };
-Analyzer::Analyzer(fs::path home) : impl_(std::make_unique<Impl>()) { impl_->home = std::move(home); }
+Analyzer::Analyzer(fs::path home, Backend backend)
+    : impl_(std::make_unique<Impl>()) {
+    impl_->home = std::move(home);
+    impl_->backend = backend;
+}
 Analyzer::~Analyzer() = default;
 Json Analyzer::ping() {
     installed_config(impl_->home, false);
@@ -92,7 +98,7 @@ Json Analyzer::analyze(const std::string& text) {
         size_t chunk_words = words(impl_->tokenizer->decode(parts[index]));
         if (chunk_words < min_words) { short_chunk = true; continue; }
         if (!impl_->model)
-            impl_->model = create_model_backend(fs::canonical(impl_->home) / "models", model_cache());
+            impl_->model = create_model_backend(fs::canonical(impl_->home) / "models", model_cache(), impl_->backend);
         auto tokens = impl_->tokenizer->wrap(parts[index]);
         double score = sigmoid(impl_->model->logit(tokens, std::vector<uint32_t>(tokens.size(), 1)));
         chunks.push_back({{"index", index}, {"score", score}, {"tokens", parts[index].size()}, {"words", chunk_words}});
@@ -229,11 +235,11 @@ void write_frame(std::ostream& stream, const Json& message) {
     stream.flush();
     if (!stream) throw Error("port_closed", "Native port closed.");
 }
-int serve(const fs::path& home) {
+int serve(const fs::path& home, Backend backend) {
     default_priority();
     std::signal(SIGPIPE, SIG_IGN);
     std::signal(SIGALRM, deadline);
-    Analyzer analyzer(home);
+    Analyzer analyzer(home, backend);
     while (true) {
         Json request;
         try {
@@ -273,6 +279,20 @@ void self_test() {
     require(text_sha256("abc") == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
     require(extension_id_valid(std::string(32, 'a')) && !extension_id_valid(std::string(32, 'q')));
     require(windows({}).empty());
+#if defined(__linux__)
+    // Automatic backend selection: without model.onnx the Candle runtime wins.
+    require(resolve_backend("/nonexistent/deckard-model", Backend::Auto) == Backend::Candle);
+    require(resolve_backend("/nonexistent/deckard-model", Backend::Onnx) == Backend::Onnx);
+    require(resolve_backend("/nonexistent/deckard-model", Backend::Candle) == Backend::Candle);
+    // The check-system report always carries the documented shape; device is
+    // whatever the host actually supports (probe result, not an assumption).
+    const Json report = system_check();
+    require(report.at("command") == "check-system" && report.contains("intel_gpu"));
+    const std::string runtime = report.at("runtime").get<std::string>();
+    const std::string device = report.at("device").get<std::string>();
+    require(runtime == "onnx" || runtime == "candle");
+    require(device == "gpu" || device == "cpu");
+#endif
     for (size_t count : {1, 510, 511, 2040, 2041}) {
         auto parts = windows(std::vector<uint32_t>(count, 7));
         size_t total = 0;

@@ -156,7 +156,7 @@ add_custom_target(dependency_notices ALL
   DEPENDS tokenizer_build VERBATIM)
 
 if(APPLE)
-  add_executable(deckard src/main.cpp src/coreml_gradient.mm src/tokenizer.cpp src/support.cpp src/host.cpp src/setup.cpp)
+  add_executable(deckard src/main.cpp src/coreml_gradient.mm src/tokenizer.cpp src/support.cpp src/host.cpp src/setup.cpp src/system_check.cpp)
   target_include_directories(deckard PRIVATE src "${CMAKE_CURRENT_BINARY_DIR}/generated")
   set_source_files_properties(src/coreml_gradient.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
   target_compile_options(deckard PRIVATE -Wall -Wextra
@@ -204,22 +204,85 @@ elseif(UNIX AND NOT APPLE)
   add_library(candle_native STATIC IMPORTED)
   set_target_properties(candle_native PROPERTIES IMPORTED_LOCATION "${CANDLE_CUDA_A}")
   add_dependencies(candle_native candle_build)
-  add_executable(deckard src/main.cpp src/gradient_backend.cpp src/tokenizer.cpp src/support.cpp src/host.cpp src/setup.cpp)
+  add_executable(deckard src/main.cpp src/gradient_backend.cpp src/onnx_backend.cpp src/onnx_install.cpp src/tokenizer.cpp src/support.cpp src/host.cpp src/setup.cpp src/system_check.cpp)
   target_include_directories(deckard PRIVATE src "${CMAKE_CURRENT_BINARY_DIR}/generated")
   target_compile_options(deckard PRIVATE -Wall -Wextra
     "-ffile-prefix-map=${AI_HIDER_ROOT}=/deckard-source"
     "-ffile-prefix-map=${NATIVE_CACHE}=/deckard-sdk")
+  set(DECKARD_RPATHS)
+  # ONNX Runtime: the pinned SDK ships no static archive, so libonnxruntime.so
+  # is embedded verbatim into the deckard binary and dlopened from memory
+  # (memfd_create) by onnx_backend.cpp. No runtime file or OS package is ever
+  # required. ORT successor dependencies (libstdc++/libm/libc) are the same
+  # base libraries deckard itself links.
+  #
+  # Intel iGPU execution uses a second embedded core: the ORT 1.24.x "openvino"
+  # wheel (API v24, structurally ABI-compatible with our v1.30 consumer
+  # headers) plus the OpenVINO 2025.4 runtime it was built against. Those blobs
+  # are materialized to the per-user cache directory only when an Intel GPU is
+  # actually usable; otherwise the memfd CPU core above remains in effect, so a
+  # system without OpenVINO never touches disk.
+  function(embed_blob source_file blob_name)
+    set(BLOB "${CMAKE_CURRENT_BINARY_DIR}/embedded/${blob_name}.bin")
+    set(BLOB_OBJECT "${CMAKE_CURRENT_BINARY_DIR}/embedded/${blob_name}.o")
+    file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/embedded")
+    add_custom_command(
+      OUTPUT "${BLOB}" "${BLOB_OBJECT}"
+      COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${source_file}" "${BLOB}"
+      COMMAND objcopy -I binary -O elf64-x86-64 -B i386:x86-64
+        --rename-section .data=.rodata,alloc,load,readonly,data,contents
+        "${blob_name}.bin" "${blob_name}.o"
+      WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/embedded"
+      DEPENDS "${source_file}"
+      VERBATIM)
+    add_custom_target(${blob_name}_target DEPENDS "${BLOB_OBJECT}")
+    add_dependencies(deckard ${blob_name}_target)
+    target_link_libraries(deckard PRIVATE "${BLOB_OBJECT}")
+  endfunction()
+  set(ONNXRUNTIME_INCLUDE "${NATIVE_CACHE}/onnxruntime/include")
+  if(EXISTS "${ONNXRUNTIME_INCLUDE}/onnxruntime_c_api.h")
+    target_include_directories(deckard PRIVATE "${ONNXRUNTIME_INCLUDE}")
+    set(ONNXRUNTIME_LIB "${NATIVE_CACHE}/onnxruntime/lib")
+    if(EXISTS "${ONNXRUNTIME_LIB}/libonnxruntime.so.1.30.0")
+      embed_blob("${ONNXRUNTIME_LIB}/libonnxruntime.so.1.30.0" onnxruntime_blob)
+    endif()
+    set(ONNXRUNTIME_OV "${NATIVE_CACHE}/onnxruntime-openvino")
+    if(EXISTS "${ONNXRUNTIME_OV}/libonnxruntime.so.1.24.1")
+      embed_blob("${ONNXRUNTIME_OV}/libonnxruntime.so.1.24.1" openvino_ortcore)
+      embed_blob("${ONNXRUNTIME_OV}/libonnxruntime_providers_openvino.so" openvino_provider)
+      embed_blob("${ONNXRUNTIME_OV}/libonnxruntime_providers_shared.so" openvino_providershared)
+      embed_blob("${ONNXRUNTIME_OV}/libopenvino.so.2541" openvino_runtime)
+      embed_blob("${ONNXRUNTIME_OV}/libopenvino_c.so.2541" openvino_capi)
+      embed_blob("${ONNXRUNTIME_OV}/libopenvino_onnx_frontend.so.2541" openvino_frontend)
+      embed_blob("${ONNXRUNTIME_OV}/libopenvino_intel_gpu_plugin.so" openvino_gpuplugin)
+      embed_blob("${ONNXRUNTIME_OV}/libtbb.so.12" openvino_tbb)
+      embed_blob("${ONNXRUNTIME_OV}/libtbbmalloc.so" openvino_tbbmalloc)
+    endif()
+  endif()
   if(EXISTS "${CANDLE_CUDA_DIR}/lib")
     target_link_directories(deckard PRIVATE "${CANDLE_CUDA_DIR}/lib")
-    set_target_properties(deckard PROPERTIES
-      BUILD_RPATH "${CANDLE_CUDA_DIR}/lib"
-      INSTALL_RPATH "${CANDLE_CUDA_DIR}/lib")
+    list(APPEND DECKARD_RPATHS "${CANDLE_CUDA_DIR}/lib")
   endif()
   if(EXISTS "${DECKARD_CUDA_HOME}/lib64")
     target_link_directories(deckard PRIVATE "${DECKARD_CUDA_HOME}/lib64")
+    list(APPEND DECKARD_RPATHS "${DECKARD_CUDA_HOME}/lib64")
+  endif()
+  # The ONNX exporter (export.py + its pinned Dockerfile) is embedded verbatim
+  # so "deckard install" can regenerate the pinned model.onnx automatically in
+  # a container image, with no external file or Python package on the host.
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/onnx/export.py"
+    "${CMAKE_CURRENT_SOURCE_DIR}/onnx/export/Dockerfile"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/onnx_export_embedded.hpp.in")
+  file(READ "${CMAKE_CURRENT_SOURCE_DIR}/onnx/export.py" ONNX_EXPORT_PY)
+  file(READ "${CMAKE_CURRENT_SOURCE_DIR}/onnx/export/Dockerfile" ONNX_EXPORT_DOCKERFILE)
+  configure_file(src/onnx_export_embedded.hpp.in
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/onnx_export_embedded.hpp" @ONLY)
+  if(DECKARD_RPATHS)
+    list(REMOVE_DUPLICATES DECKARD_RPATHS)
     set_target_properties(deckard PROPERTIES
-      BUILD_RPATH "${DECKARD_CUDA_HOME}/lib64;${CANDLE_CUDA_DIR}/lib"
-      INSTALL_RPATH "${DECKARD_CUDA_HOME}/lib64;${CANDLE_CUDA_DIR}/lib")
+      BUILD_RPATH "${DECKARD_RPATHS}"
+      INSTALL_RPATH "${DECKARD_RPATHS}")
   endif()
   # libmoe.a is the candle-kernels static archive (nvcc-compiled mm kernels).
   # Its host-side stubs call the cudart API (__cudaRegisterFatBinaryEnd, ...),

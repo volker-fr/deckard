@@ -112,7 +112,9 @@ bootstrap_linux() {
   if [ "$CACHE" != "$ROOT/cache/native-build" ]; then
     for required in json/include/nlohmann/json.hpp cargo/registry \
       rustup/toolchains/1.90.0-x86_64-unknown-linux-gnu/bin/cargo \
-      licenses/NLOHMANN-LICENSE; do
+      licenses/NLOHMANN-LICENSE onnxruntime/include/onnxruntime_c_api.h onnxruntime/lib/libonnxruntime.so \
+      licenses/ONNXRUNTIME-LICENSE onnxruntime-openvino/libonnxruntime.so.1.24.1 \
+      licenses/ONNXRUNTIME-OPENVINO-LICENSE; do
       [ -e "$CACHE/$required" ] || {
         echo "External NATIVE_CACHE is read-only and incomplete: $required" >&2
         exit 1
@@ -129,6 +131,41 @@ bootstrap_linux() {
     "$CACHE/licenses/NLOHMANN-LICENSE" 86b998c792894ccb911a1cb7994f7a9652894e7a094c0b5e45be2f553f45cf14
   fetch 'https://huggingface.co/ShantanuT01/gradient-ai-text-detector/raw/c2e8b6df87f8a211cbffb713fa9873a0c3a9713f/README.md' \
     "$CACHE/licenses/GRADIENT-MODEL-CARD.md" a147869ab24ad59172bcdc7cc69cf716c646ddf0745a0e1fbb12515a2c6e752a
+  # ONNX Runtime: embedded by CMake into the deckard binary and dlopened over
+  # an anonymous memfd by onnx_backend.cpp whenever model.onnx is present. It
+  # is staged into the build cache only, so deckard never depends on a system
+  # package or an external runtime file.
+  fetch 'https://github.com/microsoft/onnxruntime/releases/download/v1.30.0/onnxruntime-linux-x64-1.30.0.tgz' \
+    "$DOWNLOADS/onnxruntime-linux-x64-1.30.0.tgz" a5ed5a3cac51fbb2e90da632ae43d19212faaa20e76484e62bcb7c23ddb3b3fd
+  mkdir -p "$CACHE/onnxruntime"
+  tar xzf "$DOWNLOADS/onnxruntime-linux-x64-1.30.0.tgz" -C "$CACHE/onnxruntime" --strip-components=1
+  cp "$CACHE/onnxruntime/LICENSE" "$CACHE/licenses/ONNXRUNTIME-LICENSE"
+  # Intel iGPU GPU execution provider. ONNX Runtime's OpenVINO EP lives only in
+  # the ORT 1.24.x "openvino" release (API v24 structurally ABI-compatible with
+  # our v1.30 consumer headers); newer releases no longer ship a GPU EP. The
+  # wheel carries the core, the OpenVINO provider, and the full OpenVINO 2025.4
+  # runtime as regular .so files that onnx_backend.cpp embeds verbatim and
+  # materializes to the per-user cache directory only when an Intel GPU is
+  # present. The OpenVINO CPU plugin is omitted: CPU inference falls back to the
+  # ONNX Runtime CPU EP built into the same core.
+  fetch 'https://files.pythonhosted.org/packages/99/16/69ca742f0b65c40d4de3ff44bb6abc23c47b23e932bc901116176ae69922/onnxruntime_openvino-1.24.1-cp311-cp311-manylinux_2_28_x86_64.whl' \
+    "$DOWNLOADS/onnxruntime-openvino-1.24.1.whl" 3007c803634cc69c6d52af1dea7ce729d9bb62b9a11070fd2f959119199007a8
+  mkdir -p "$CACHE/onnxruntime-openvino"
+  unzip -joq "$DOWNLOADS/onnxruntime-openvino-1.24.1.whl" \
+    'onnxruntime/capi/libonnxruntime.so.1.24.1' \
+    'onnxruntime/capi/libonnxruntime_providers_openvino.so' \
+    'onnxruntime/capi/libonnxruntime_providers_shared.so' \
+    'onnxruntime/capi/libopenvino.so.2541' \
+    'onnxruntime/capi/libopenvino_c.so.2541' \
+    'onnxruntime/capi/libopenvino_onnx_frontend.so.2541' \
+    'onnxruntime/capi/libopenvino_intel_gpu_plugin.so' \
+    'onnxruntime/capi/libtbb.so.12' \
+    'onnxruntime/capi/libtbbmalloc.so' \
+    -d "$CACHE/onnxruntime-openvino"
+  unzip -poq "$DOWNLOADS/onnxruntime-openvino-1.24.1.whl" \
+    'onnxruntime/LICENSE' > "$CACHE/licenses/ONNXRUNTIME-OPENVINO-LICENSE"
+  unzip -poq "$DOWNLOADS/onnxruntime-openvino-1.24.1.whl" \
+    'onnxruntime/ThirdPartyNotices.txt' > "$CACHE/licenses/ONNXRUNTIME-OPENVINO-THIRD-PARTY-NOTICES.txt"
   # A symlink clone of an existing system toolchain satisfies the pinned SDK
   # toolchain path offline, without ever contacting static.rust-lang.org.
   TOOLCHAIN="$CACHE/rustup/toolchains/1.90.0-x86_64-unknown-linux-gnu"

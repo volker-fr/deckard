@@ -8,6 +8,7 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <cstring>
 #include <fstream>
@@ -152,7 +153,7 @@ OnnxBackend::Impl::~Impl() {
 // memfd CPU core. Callers invoke this only after the capability probe passed.
 bool OnnxBackend::Impl::try_openvino(const fs::path& ov_dir) {
   struct ReleaseOwned {
-    std::array<void*, 9> handles{};
+    std::vector<void*> handles = std::vector<void*>(openvino_load_order().size());
     ~ReleaseOwned() {
       for (void* handle : handles)
         if (handle) dlclose(handle);
@@ -166,16 +167,16 @@ bool OnnxBackend::Impl::try_openvino(const fs::path& ov_dir) {
       write_blob(ov_dir, blob);
     }
 
-    // An OpenCL Intel GPU is not enough: the provider's global static
-    // initializer enumerates the GPU during dlopen and segfaults on a device it
-    // cannot drive, which no error path here can catch. Prove the load in a
-    // forked child first and fall back to the CPU core when it dies.
+    // Prove the runtime loads in a forked child first and fall back to the CPU
+    // core when it dies, since a crash in a library initializer cannot be
+    // caught here.
     if (!openvino_runtime_loads(ov_dir.string())) return false;
 
     // Dependency order matters for the OpenVINO runtime: NEEDED resolution
     // walks the already-loaded set first. All blobs share the directory, so
     // RPATH $ORIGIN resolves the siblings; loading the core last lets ORT
-    // discover the sibling providers relative to its own real location.
+    // discover the sibling providers relative to its own real location. The
+    // OpenVINO provider itself is loaded by the core (see openvino_load_order).
     const auto& load_order = openvino_load_order();
     for (size_t i = 0; i < load_order.size(); ++i) {
       void* handle = dlopen((ov_dir / load_order[i]).c_str(), RTLD_NOW | RTLD_GLOBAL);
@@ -196,13 +197,20 @@ bool OnnxBackend::Impl::try_openvino(const fs::path& ov_dir) {
     check(api->CreateSessionOptions(&options));
     check(api->SetSessionGraphOptimizationLevel(options, ORT_ENABLE_ALL));
     check(api->SetIntraOpNumThreads(options, 1));
+    // cache_dir (OpenVINO's compiled-model cache) is deliberately left unset.
+    // Measured on a UHD 630 (Gen9.5, intel-compute-runtime-legacy 24.35) with
+    // the 1.8 GB fp32 model.onnx (If-folded, before export.py added inferred
+    // shapes): session load 14.5 s uncached vs 13.3 s with a warm cache, but the
+    // cache blob embeds the weights and occupies 1.8 GB. Load time is dominated
+    // by reading and converting the model, not by kernel compilation, so the
+    // cache doubles disk use for ~1 s. The pinned export loads in ~8 s.
     OrtOpenVINOProviderOptions ov_options{};
     ov_options.device_type = "GPU_FP32";
     check(api->SessionOptionsAppendExecutionProvider_OpenVINO(options, &ov_options));
     check(api->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault, &memory));
     load_model_from_array();
     // Transfer ownership: the OpenVINO core stays loaded for this instance.
-    owned.handles.fill(nullptr);
+    std::fill(owned.handles.begin(), owned.handles.end(), nullptr);
     return true;
   } catch (...) {
     // OpenVINO is unusable here (libOpenCL missing, the GPU plugin cannot

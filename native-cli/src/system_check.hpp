@@ -32,25 +32,30 @@ std::vector<OpenCLDevice> opencl_gpu_devices();
 // provider may be engaged.
 bool usable_intel_gpu();
 
-// Dependency order of the materialized OpenVINO wheel core + GPU provider. The
-// runtime loads exactly this sequence, and the load probe below validates it.
+// Dependency order of the materialized OpenVINO wheel core. The runtime loads
+// exactly this sequence, and the load probe below validates it. The OpenVINO
+// execution provider is not in it: the ORT core loads that library itself.
 const std::vector<std::string>& openvino_load_order();
 
 // Whether that OpenVINO core can be dlopened from `directory` without killing
-// the process. libonnxruntime_providers_openvino.so enumerates Intel GPU
-// devices in a global static initializer, so an OpenCL device that exists but
-// is unusable (an unsupported generation, an insufficient memlock limit) makes
-// the provider segfault *during dlopen* - uncatchable by the runtime's own
-// error handling. The load therefore runs in a forked child; only a clean exit
-// counts as usable, so an unloadable provider degrades to the CPU core instead
-// of crashing. Results are cached per directory for the process lifetime.
+// the process. A crash in a library initializer is uncatchable by the
+// runtime's own error handling, so the load runs in a forked child; only a
+// clean exit counts as usable, and an unloadable runtime degrades to the CPU
+// core instead of crashing. Results are cached per directory for the process
+// lifetime.
 bool openvino_runtime_loads(const std::string& directory);
 
-// Whether an i915 device is bound under /sys/class/drm.
+// Whether an Intel display controller (PCI vendor 0x8086) is present.
 bool intel_gpu_present();
+
+// The kernel driver bound to that Intel GPU (i915 or xe), or "" when none is.
+std::string intel_kernel_driver();
 
 // Whether an Intel OpenCL driver is registered under /etc/OpenCL/vendors.
 bool intel_icd_present();
+
+// Whether an NVIDIA display controller (PCI vendor 0x10de) is present.
+bool nvidia_gpu_present();
 
 // Whether the CUDA driver (libcuda.so.1, NVIDIA) is loadable.
 bool cuda_driver_present();

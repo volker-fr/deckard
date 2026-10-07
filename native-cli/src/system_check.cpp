@@ -71,18 +71,36 @@ bool opencl_loader_present() {
   return true;
 }
 
-bool intel_gpu_present() {
+namespace {
+// The first PCI display controller (base class 0x03: VGA, 3D, ...) from
+// `vendor`, with the kernel driver bound to it ("" when none is bound).
+bool pci_display_device(const std::string& vendor, std::string& driver) {
   std::error_code error;
-  const fs::path drm("/sys/class/drm");
-  if (!fs::is_directory(drm, error)) return false;
-  for (const auto& entry : fs::directory_iterator(drm, fs::directory_options::skip_permission_denied, error)) {
-    if (error) break;
+  const fs::path pci("/sys/bus/pci/devices");
+  for (const auto& entry : fs::directory_iterator(pci, fs::directory_options::skip_permission_denied, error)) {
+    std::ifstream vendor_file(entry.path() / "vendor"), class_file(entry.path() / "class");
+    std::string device_vendor, device_class;
+    vendor_file >> device_vendor;
+    class_file >> device_class;
+    if (device_vendor != vendor || device_class.rfind("0x03", 0) != 0) continue;
     std::error_code link_error;
-    auto target = fs::read_symlink(entry.path() / "device/driver", link_error);
-    if (link_error) continue;
-    if (target.filename() == "i915") return true;
+    driver = fs::read_symlink(entry.path() / "driver", link_error).filename().string();
+    if (link_error) driver.clear();
+    return true;
   }
   return false;
+}
+}  // namespace
+
+bool intel_gpu_present() {
+  std::string driver;
+  return pci_display_device("0x8086", driver);
+}
+
+std::string intel_kernel_driver() {
+  std::string driver;
+  pci_display_device("0x8086", driver);
+  return driver;
 }
 
 bool intel_icd_present() {
@@ -99,6 +117,11 @@ bool intel_icd_present() {
     if (line.find("intel") != std::string::npos || line.find("igdrcl") != std::string::npos) return true;
   }
   return false;
+}
+
+bool nvidia_gpu_present() {
+  std::string driver;
+  return pci_display_device("0x10de", driver);
 }
 
 bool cuda_driver_present() {
@@ -158,8 +181,9 @@ std::vector<OpenCLDevice> opencl_gpu_devices() {
   return devices;
 }
 
-bool usable_intel_gpu() {
-  for (const auto& device : opencl_gpu_devices()) {
+namespace {
+bool intel_gpu_in(const std::vector<OpenCLDevice>& devices) {
+  for (const auto& device : devices) {
     if (software_renderer(device.name)) continue;
     // The authoritative signal is Intel's PCI vendor id (0x8086). Drivers that
     // do not answer CL_DEVICE_VENDOR_ID are accepted only when the device is on
@@ -170,13 +194,39 @@ bool usable_intel_gpu() {
   }
   return false;
 }
+}  // namespace
+
+// Enumerating platforms makes ocl-icd dlopen every ICD into the global symbol
+// scope. ICDs such as pocl export clGetExtensionFunctionAddressForPlatform
+// themselves, so if this ran in-process before OpenVINO, the GPU plugin would
+// later bind that symbol to pocl instead of the loader and get NULL for every
+// Intel USM entry point ("clHostMemAllocINTEL is nullptr"). Probe in a forked
+// child so the process that may host OpenVINO never loads an ICD first.
+bool usable_intel_gpu() {
+  static std::once_flag once;
+  static bool usable = false;
+  std::call_once(once, [] {
+    const pid_t child = ::fork();
+    if (child == 0) ::_exit(intel_gpu_in(opencl_gpu_devices()) ? 0 : 1);
+    if (child < 0) return;
+    int status = 0;
+    while (::waitpid(child, &status, 0) < 0 && errno == EINTR) {
+    }
+    usable = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+  });
+  return usable;
+}
 
 const std::vector<std::string>& openvino_load_order() {
+  // libonnxruntime_providers_openvino.so is deliberately absent: its static
+  // initializer dereferences Provider_GetHost(), which is NULL until the ORT
+  // core has called Provider_SetHost. The core dlopens the provider from its
+  // own directory when the OpenVINO execution provider is appended.
   static const std::vector<std::string> order = {
       "libtbb.so.12", "libtbbmalloc.so", "libopenvino_c.so.2541",
       "libopenvino.so.2541", "libopenvino_onnx_frontend.so.2541",
       "libopenvino_intel_gpu_plugin.so", "libonnxruntime_providers_shared.so",
-      "libonnxruntime_providers_openvino.so", "libonnxruntime.so.1.24.1"};
+      "libonnxruntime.so.1.24.1"};
   return order;
 }
 
@@ -246,18 +296,21 @@ Json system_check() {
   if (::uname(&uname_data) == 0) report["arch"] = uname_data.machine;
   report["platform"] = "linux";
   report["os"] = distro_id();
-  report["embedded_runtimes"] = Json::array({"onnx", "candle"});
+  report["runtimes"] = Json::array({"onnx", "candle"});
 
   const bool loader = opencl_loader_present();
-  const bool i915 = intel_gpu_present();
+  const bool intel_present = intel_gpu_present();
+  const std::string intel_driver = intel_kernel_driver();
   const bool icd = intel_icd_present();
   const bool cuda = cuda_driver_present();
+  const bool nvidia = nvidia_gpu_present();
   const auto devices = opencl_gpu_devices();
 
   Json gpu = Json::object();
-  gpu["loader"] = loader;
-  gpu["intel_icd"] = icd;
-  gpu["i915"] = i915;
+  gpu["present"] = intel_present;
+  gpu["kernel_driver"] = intel_driver.empty() ? Json() : Json(intel_driver);
+  gpu["opencl_loader"] = loader;
+  gpu["opencl_driver"] = icd;
   Json device_list = Json::array();
   for (const auto& device : devices) {
     std::ostringstream vendor;
@@ -266,10 +319,10 @@ Json system_check() {
         Json{{"platform", device.platform}, {"vendor", vendor.str()}, {"name", device.name}});
   }
   gpu["devices"] = device_list;
-  gpu["usable_intel_gpu"] = usable_intel_gpu();
-  report["gpu_opencl"] = gpu;
+  gpu["usable"] = usable_intel_gpu();
+  report["intel_gpu"] = gpu;
 
-  report["nvidia_cuda"] = Json{{"driver", cuda}};
+  report["nvidia_gpu"] = Json{{"present", nvidia}, {"cuda_driver", cuda}};
 
   std::string engine;
   std::string engine_name;
@@ -297,7 +350,7 @@ Json system_check() {
   Json models = Json::object();
   models["cache"] = cache.string();
   models["candle"] = candle_assets ? "ready" : "missing";
-  models["onnx"] = onnx_asset ? (onnx_pinned ? "pinned" : "present-but-drifted") : "missing";
+  models["onnx"] = onnx_asset ? (onnx_pinned ? "ready" : "drifted") : "missing";
   report["models"] = models;
 
   Json problems = Json::array();
@@ -313,39 +366,46 @@ Json system_check() {
   const bool intel_gpu = usable_intel_gpu();
   const bool provider_loads = intel_gpu && openvino_runtime_loads(ov_dir.string());
   const bool accelerated = intel_gpu && provider_loads;
-  if (intel_gpu) {
-    Json openvino = Json::object();
-    openvino["directory"] = ov_dir.string();
-    openvino["provider_loads"] = provider_loads;
-    report["openvino"] = openvino;
+  report["openvino"] = Json{{"directory", ov_dir.string()}, {"loads", provider_loads}};
+  // The kernel driver, OpenCL loader and Intel OpenCL driver are independent,
+  // so every missing one is reported. Whether that driver exposes the GPU, and
+  // whether OpenVINO loads against it, can only be judged once all three are
+  // present; before that, their failure is a mere consequence.
+  const std::string cpu_fallback = " Until then ONNX inference runs on the CPU core.";
+  const bool intel_stack = !intel_driver.empty() && loader && icd;
+  if (intel_present && intel_driver.empty()) {
+    problems.push_back("Intel GPU present but no kernel driver (i915 or xe) is bound to it");
+    help.push_back("Enable the i915 (or, for Xe2 and newer, xe) kernel driver for the Intel GPU." +
+                   cpu_fallback);
   }
-  if (i915 && !loader) {
-    problems.push_back("Missing OpenCL loader: libOpenCL.so.1");
-    help.push_back("An Intel GPU is present but the OpenCL loader is missing. It must come from your "
-                   "distribution (Deckard never installs it); the embedded ONNX CPU core is used "
-                   "until the OpenCL stack is present.");
+  if (intel_present && !loader) {
+    problems.push_back("Intel GPU present but the OpenCL loader (libOpenCL.so.1) is missing");
+    help.push_back("Install the OpenCL ICD loader from your distribution (ocl-icd)." + cpu_fallback);
   }
-  if (loader && !intel_gpu) {
-    problems.push_back("No usable Intel GPU for OpenVINO: the installed OpenCL stack exposes no "
-                       "Intel GPU device.");
-    help.push_back("The Intel OpenCL stack is installed but does not expose a usable GPU. Current "
-                   "intel-compute-runtime supports Gen12+ only; for Gen8/9/11 (e.g. UHD 630) install "
-                   "the legacy1 24.35 branch (intel-opencl-icd-legacy1) instead. Until then the ONNX "
-                   "CPU core is used.");
+  if (intel_present && !icd) {
+    problems.push_back("Intel GPU present but no Intel OpenCL driver is installed");
+    help.push_back("Install Intel's OpenCL driver from your distribution: intel-compute-runtime for "
+                   "Gen12 and newer, or the legacy 24.35 branch (intel-compute-runtime-legacy / "
+                   "intel-opencl-icd-legacy1) for Gen8 to Gen11 such as UHD 630." + cpu_fallback);
   }
-  if (intel_gpu && !provider_loads) {
-    problems.push_back("The Intel GPU is visible to OpenCL but the OpenVINO runtime fails to load "
-                       "against it, so ONNX inference runs on the CPU core.");
-    help.push_back("OpenVINO loads the GPU in a library initializer and this driver crashes there, "
-                   "which Deckard detects in a forked process and works around by using the CPU core. "
-                   "On Intel iGPUs the usual cause is the memlock limit: raise it (for example "
-                   "'LimitMEMLOCK=infinity' in /etc/security/limits.conf, then log in again) or use a "
-                   "driver generation OpenVINO supports.");
+  if (intel_present && intel_stack && !intel_gpu) {
+    problems.push_back("Intel GPU present but the installed Intel OpenCL driver does not expose it");
+    help.push_back("The Intel OpenCL driver probably does not support this GPU generation: current "
+                   "intel-compute-runtime supports Gen12 and newer only; Gen8 to Gen11 (e.g. UHD 630) "
+                   "need the legacy 24.35 branch (intel-compute-runtime-legacy / "
+                   "intel-opencl-icd-legacy1)." + cpu_fallback);
+  } else if (intel_gpu && !provider_loads) {
+    problems.push_back("Intel GPU usable through OpenCL but the embedded OpenVINO runtime fails to "
+                       "load against it");
+    help.push_back("A library of the embedded OpenVINO runtime crashed or failed to load, which "
+                   "Deckard detects in a forked process and works around by using the CPU core. "
+                   "Check that the Intel OpenCL driver matches the GPU generation OpenVINO "
+                   "supports.");
   }
-  if (!cuda) {
-    problems.push_back("CUDA driver (libcuda.so.1) not detected");
-    help.push_back("A CUDA GPU would need the NVIDIA driver/CUDA on the system; it is not present. "
-                   "The embedded Candle CPU runtime always remains available.");
+  if (nvidia && !cuda) {
+    problems.push_back("NVIDIA GPU present but the CUDA driver (libcuda.so.1) is not loadable");
+    help.push_back("Install the NVIDIA driver from your distribution to use CUDA; until then the "
+                   "embedded CPU runtimes are used.");
   }
   if (onnx_asset && !onnx_pinned)
     help.push_back("model.onnx in the model cache does not match the pinned checksum; reinstall it "
@@ -361,7 +421,8 @@ Json system_check() {
   report["problems"] = problems;
   report["help"] = help;
   report["accelerated"] = accelerated;
-  report["expected_device"] = accelerated ? "gpu" : (onnx_asset ? "cpu" : "candle");
+  report["runtime"] = onnx_asset ? "onnx" : "candle";
+  report["device"] = accelerated ? "gpu" : "cpu";
 #else
   report["platform"] = "apple";
   report["note"] = "GPU capability diagnostics are Linux-only; the Core ML runtime serves macOS.";
@@ -369,7 +430,8 @@ Json system_check() {
       {"Deckard uses the prebuilt Core ML runtime on macOS.",
        "No vendor GPU driver is required; a missing model is reinstalled with: deckard install"});
   report["accelerated"] = false;
-  report["expected_device"] = "cpu";
+  report["runtime"] = "coreml";
+  report["device"] = "cpu";
 #endif
   return report;
 }

@@ -422,15 +422,24 @@ void verify_model_assets(const fs::path& directory, bool verify_hashes, bool all
         if (verify_hashes) require_hash(root / relative, it.value().get<std::string>());
     }
     // The Candle backend reads exactly the pinned files; nothing else must be
-    // hidden inside the model directory.
+    // hidden inside the model directory. model.onnx is the generated ONNX
+    // Runtime asset (see model_assets().at("onnx")): when present it is
+    // pinned, but it stays optional so a Candle-only install remains valid.
     if (!allow_unpinned) {
         for (const auto& entry : fs::recursive_directory_iterator(root)) {
             const auto relative = entry.path().lexically_relative(root);
             const auto status = entry.symlink_status();
             if ((fs::is_directory(status) && directories.count(relative)) ||
-                (fs::is_regular_file(status) && files.contains(relative.generic_string()))) continue;
+                (fs::is_regular_file(status) &&
+                 (files.contains(relative.generic_string()) || relative.generic_string() == "model.onnx"))) continue;
             throw Error("asset_mismatch", "The Candle model directory contains unexpected assets.");
         }
+    }
+    const auto& onnx = model_assets().value("onnx", Json());
+    if (onnx.is_object() && onnx.contains("sha256") && verify_hashes && !allow_unpinned) {
+        const auto onnx_model = root / "model.onnx";
+        if (fs::is_regular_file(onnx_model))
+            require_hash(onnx_model, onnx["sha256"].get<std::string>());
     }
 }
 Json installed_config(const fs::path& home, bool verify) {
