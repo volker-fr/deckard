@@ -18,6 +18,10 @@ class ModelBackend {
   virtual ~ModelBackend() = default;
   virtual double logit(const std::vector<std::uint32_t>& ids,
                        const std::vector<std::uint32_t>& mask) = 0;
+  // The device that serves inference: the platform default (Core ML's
+  // "cpu_and_neural_engine", otherwise "cpu") unless an accelerator such as
+  // "gpu" is active.
+  virtual const char* device() const;
   // The runtime that serves inference: the platform runtime_id ("native-coreml",
   // "native-candle") or "native-onnx".
   virtual const char* runtime() const;
@@ -29,6 +33,15 @@ class ModelBackend {
 // runtime without fallback. macOS always uses Core ML.
 enum class Backend { Auto, Candle, Onnx };
 
+struct BackendOptions {
+  Backend backend = Backend::Auto;
+  // Linux: let ONNX Runtime try its accelerators (execution_providers(), today
+  // OpenVINO on Intel GPUs) before the CPU. Off by default: on the GPUs
+  // measured so far it costs memory and start-up without being faster
+  // (docs/LINUX.md, "Intel GPUs").
+  bool gpu = false;
+};
+
 // The runtime that Backend::Auto starts with for `model_directory`.
 Backend resolve_backend(const std::filesystem::path& model_directory, Backend backend);
 
@@ -36,7 +49,7 @@ Backend resolve_backend(const std::filesystem::path& model_directory, Backend ba
 std::unique_ptr<ModelBackend> create_model_backend(
     const std::filesystem::path& model_directory,
     const std::filesystem::path& cache_directory,
-    Backend backend = Backend::Auto);
+    const BackendOptions& options = {});
 
 #if defined(__linux__)
 using BackendFactory = std::function<std::unique_ptr<ModelBackend>()>;

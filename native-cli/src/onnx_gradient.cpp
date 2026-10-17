@@ -1,10 +1,12 @@
 #include "onnx_gradient.hpp"
 
 #include "gradient_backend.hpp"
+#include "onnx_providers.hpp"
 #include "onnx_runtime.hpp"
 
 #include <cmath>
 #include <functional>
+#include <iostream>
 
 namespace aihider {
 namespace {
@@ -20,6 +22,7 @@ struct OnnxGradient::Impl {
   Owned<OrtEnv> env;
   Owned<OrtMemoryInfo> memory;
   Owned<OrtSession> session;
+  const char* device = "cpu";
 
   explicit Impl(const OrtApi& runtime) : api(runtime) {}
 
@@ -28,12 +31,14 @@ struct OnnxGradient::Impl {
     return Owned<T>(object, [release](T* value) { if (value) release(value); });
   }
 
-  Owned<OrtSession> open(const fs::path& model) {
+  // Opens the session on `provider`, or on the CPU provider when null.
+  Owned<OrtSession> open(const fs::path& model, const ExecutionProvider* provider) {
     OrtSessionOptions* raw_options = nullptr;
     onnx_check(api, api.CreateSessionOptions(&raw_options), "onnx_unavailable", "Cannot create session options");
     auto options = own(raw_options, api.ReleaseSessionOptions);
     onnx_check(api, api.SetSessionGraphOptimizationLevel(options.get(), ORT_ENABLE_ALL), "onnx_unavailable",
                "Cannot configure the session");
+    if (provider) provider->append(api, options.get());
     OrtSession* raw_session = nullptr;
     onnx_check(api, api.CreateSession(env.get(), model.c_str(), options.get(), &raw_session), "onnx_unavailable",
                "Cannot open model.onnx");
@@ -41,7 +46,7 @@ struct OnnxGradient::Impl {
   }
 };
 
-OnnxGradient::OnnxGradient(const fs::path& model_directory, const fs::path& cache_directory) {
+OnnxGradient::OnnxGradient(const fs::path& model_directory, const fs::path& cache_directory, bool use_accelerators) {
   verify_model_assets(model_directory, false);
   if (!fs::is_regular_file(model_directory / "model.onnx"))
     throw Error("missing_assets", "The ONNX Runtime backend needs model.onnx in the model directory.");
@@ -49,6 +54,12 @@ OnnxGradient::OnnxGradient(const fs::path& model_directory, const fs::path& cach
 
   impl_ = std::make_unique<Impl>(onnx_runtime(cache_directory));
   const OrtApi& api = impl_->api;
+  // Probe providers first: probes may fork, which is only safe before this
+  // process creates an ONNX Runtime environment and its threads.
+  std::vector<const ExecutionProvider*> usable;
+  for (const auto& provider : execution_providers()) {
+    if (use_accelerators && provider.usable(api)) usable.push_back(&provider);
+  }
   OrtEnv* env = nullptr;
   onnx_check(api, api.CreateEnv(ORT_LOGGING_LEVEL_WARNING, "deckard", &env), "onnx_unavailable",
              "Cannot create the ONNX Runtime environment");
@@ -58,10 +69,22 @@ OnnxGradient::OnnxGradient(const fs::path& model_directory, const fs::path& cach
              "Cannot describe CPU memory");
   impl_->memory = impl_->own(memory, api.ReleaseMemoryInfo);
 
-  impl_->session = impl_->open(model_directory / "model.onnx");
+  const fs::path model = model_directory / "model.onnx";
+  for (const ExecutionProvider* provider : usable) {
+    try {
+      impl_->session = impl_->open(model, provider);
+      impl_->device = provider->device;
+      return;
+    } catch (const Error& error) {
+      std::cerr << "Deckard: " << provider->name << " unavailable (" << error.what() << "); trying the next provider.\n";
+    }
+  }
+  impl_->session = impl_->open(model, nullptr);
 }
 
 OnnxGradient::~OnnxGradient() = default;
+
+const char* OnnxGradient::device() const { return impl_->device; }
 
 double OnnxGradient::logit(const std::vector<std::uint32_t>& ids, const std::vector<std::uint32_t>& mask) {
   validate_gradient_input(ids, mask);
