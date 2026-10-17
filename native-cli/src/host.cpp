@@ -77,7 +77,7 @@ void auto_backend_self_test(const std::function<void(bool)>& require) {
 }
 struct Analyzer::Impl {
     fs::path home;
-    Backend backend = Backend::Auto;
+    BackendOptions options;
     std::unique_ptr<Tokenizer> tokenizer;
     std::unique_ptr<ModelBackend> model;
     std::list<std::pair<std::string, Json>> cache;
@@ -89,9 +89,9 @@ struct Analyzer::Impl {
         tokenizer = std::make_unique<Tokenizer>(path);
     }
 };
-Analyzer::Analyzer(fs::path home, Backend backend) : impl_(std::make_unique<Impl>()) {
+Analyzer::Analyzer(fs::path home, BackendOptions options) : impl_(std::make_unique<Impl>()) {
     impl_->home = std::move(home);
-    impl_->backend = backend;
+    impl_->options = options;
 }
 Analyzer::~Analyzer() = default;
 Json Analyzer::ping() {
@@ -149,8 +149,12 @@ Json Analyzer::analyze(const std::string& text) {
     for (size_t index = 0; index < parts.size(); ++index) {
         size_t chunk_words = words(impl_->tokenizer->decode(parts[index]));
         if (chunk_words < min_words) { short_chunk = true; continue; }
-        if (!impl_->model)
-            impl_->model = create_model_backend(fs::canonical(impl_->home) / "models", model_cache(), impl_->backend);
+        if (!impl_->model) {
+            // deckard install --gpu records the opt-in for the Chrome-launched host.
+            auto options = impl_->options;
+            options.gpu = options.gpu || installed_config(impl_->home, false).value("onnx_gpu", false);
+            impl_->model = create_model_backend(fs::canonical(impl_->home) / "models", model_cache(), options);
+        }
         auto tokens = impl_->tokenizer->wrap(parts[index]);
         double score = sigmoid(impl_->model->logit(tokens, std::vector<uint32_t>(tokens.size(), 1)));
         chunks.push_back({{"index", index}, {"score", score}, {"tokens", parts[index].size()}, {"words", chunk_words}});
@@ -287,11 +291,11 @@ void write_frame(std::ostream& stream, const Json& message) {
     stream.flush();
     if (!stream) throw Error("port_closed", "Native port closed.");
 }
-int serve(const fs::path& home, Backend backend) {
+int serve(const fs::path& home, BackendOptions options) {
     default_priority();
     std::signal(SIGPIPE, SIG_IGN);
     std::signal(SIGALRM, deadline);
-    Analyzer analyzer(home, backend);
+    Analyzer analyzer(home, options);
     while (true) {
         Json request;
         try {

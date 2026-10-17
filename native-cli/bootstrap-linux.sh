@@ -6,8 +6,10 @@
 # for the tokenizer and Candle crates. System packages (a C++ compiler, CMake,
 # pkg-config, OpenSSL and libcurl development headers) are only checked, never
 # installed.
-# It also fetches the official ONNX Runtime release (headers, library,
-# license notices) for the ONNX Runtime backend.
+# It also fetches ONNX Runtime for the ONNX Runtime backend: the headers from
+# the official release, the libraries (core, OpenVINO execution provider, the
+# OpenVINO parts it needs for Intel GPUs) from the onnxruntime-openvino wheel,
+# and their license notices.
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
@@ -15,8 +17,9 @@ CACHE="${NATIVE_CACHE:-$ROOT/cache/native-build}"
 DOWNLOADS="$CACHE/downloads"
 HOST=x86_64-unknown-linux-gnu
 TOOLCHAIN="$CACHE/rustup/toolchains/1.90.0-$HOST"
-# ONNX Runtime; the version must match linux.cmake.
+# ONNX Runtime and the OpenVINO in its wheel; the versions must match linux.cmake.
 ORT_VERSION=1.24.1
+OPENVINO_VERSION=2025.4.1
 ORT="$CACHE/onnxruntime-$ORT_VERSION"
 
 fail() { echo "$*" >&2; exit 1; }
@@ -42,7 +45,9 @@ require_pinned_toolchain() {
 if [ "$CACHE" != "$ROOT/cache/native-build" ]; then
   for required in json/include/nlohmann/json.hpp cargo/registry "rustup/toolchains/1.90.0-$HOST/bin/cargo" \
     licenses/NLOHMANN-LICENSE "onnxruntime-$ORT_VERSION/include/onnxruntime_c_api.h" licenses/ONNXRUNTIME-LICENSE \
-    "onnxruntime-$ORT_VERSION/lib/libonnxruntime.so.$ORT_VERSION" licenses/ONNXRUNTIME-THIRD-PARTY-NOTICES.txt; do
+    "onnxruntime-$ORT_VERSION/lib/libonnxruntime.so.$ORT_VERSION" licenses/ONNXRUNTIME-THIRD-PARTY-NOTICES.txt \
+    "onnxruntime-$ORT_VERSION/lib/libopenvino_intel_gpu_plugin.so" licenses/OPENVINO-LICENSE \
+    licenses/OPENVINO-THIRD-PARTY-PROGRAMS.txt; do
     [ -e "$CACHE/$required" ] || fail "External NATIVE_CACHE is read-only and incomplete: $required"
   done
   require_pinned_toolchain
@@ -76,13 +81,35 @@ fetch 'https://huggingface.co/ShantanuT01/gradient-ai-text-detector/raw/c2e8b6df
 ORT_ARCHIVE="onnxruntime-linux-x64-$ORT_VERSION"
 fetch "https://github.com/microsoft/onnxruntime/releases/download/v$ORT_VERSION/$ORT_ARCHIVE.tgz" \
   "$DOWNLOADS/$ORT_ARCHIVE.tgz" 9142552248b735920f9390027e4512a2cacf8946a1ffcbe9071a5c210531026f
-mkdir -p "$ORT"
-tar -xzf "$DOWNLOADS/$ORT_ARCHIVE.tgz" -C "$ORT" --strip-components=1 \
-  "$ORT_ARCHIVE/include" "$ORT_ARCHIVE/lib/libonnxruntime.so.$ORT_VERSION"
-tar -xOzf "$DOWNLOADS/$ORT_ARCHIVE.tgz" "$ORT_ARCHIVE/LICENSE" \
-  > "$CACHE/licenses/ONNXRUNTIME-LICENSE"
-tar -xOzf "$DOWNLOADS/$ORT_ARCHIVE.tgz" "$ORT_ARCHIVE/ThirdPartyNotices.txt" \
+mkdir -p "$ORT/lib"
+tar -xzf "$DOWNLOADS/$ORT_ARCHIVE.tgz" -C "$ORT" --strip-components=1 "$ORT_ARCHIVE/include"
+# The libraries come from the onnxruntime-openvino wheel, the only build that
+# can load the OpenVINO execution provider: the core, the provider and the
+# parts of OpenVINO it needs for Intel GPUs (no CPU or NPU plugin). deckard
+# embeds them and writes them next to each other; their RPATH is $ORIGIN.
+ORT_WHEEL="onnxruntime_openvino-$ORT_VERSION-cp311-cp311-manylinux_2_28_x86_64.whl"
+fetch "https://files.pythonhosted.org/packages/99/16/69ca742f0b65c40d4de3ff44bb6abc23c47b23e932bc901116176ae69922/$ORT_WHEEL" \
+  "$DOWNLOADS/$ORT_WHEEL" 3007c803634cc69c6d52af1dea7ce729d9bb62b9a11070fd2f959119199007a8
+# OpenVINO 2025.4.1 names its libraries *.so.2541.
+OPENVINO_SO=$(echo "$OPENVINO_VERSION" | cut -c3- | tr -d .)
+unzip -joq "$DOWNLOADS/$ORT_WHEEL" -d "$ORT/lib" \
+  "onnxruntime/capi/libonnxruntime.so.$ORT_VERSION" \
+  onnxruntime/capi/libonnxruntime_providers_shared.so \
+  onnxruntime/capi/libonnxruntime_providers_openvino.so \
+  "onnxruntime/capi/libopenvino.so.$OPENVINO_SO" \
+  "onnxruntime/capi/libopenvino_onnx_frontend.so.$OPENVINO_SO" \
+  onnxruntime/capi/libopenvino_intel_gpu_plugin.so \
+  onnxruntime/capi/libtbb.so.12 \
+  onnxruntime/capi/libtbbmalloc.so
+unzip -poq "$DOWNLOADS/$ORT_WHEEL" onnxruntime/LICENSE > "$CACHE/licenses/ONNXRUNTIME-LICENSE"
+unzip -poq "$DOWNLOADS/$ORT_WHEEL" onnxruntime/ThirdPartyNotices.txt \
   > "$CACHE/licenses/ONNXRUNTIME-THIRD-PARTY-NOTICES.txt"
+# The wheel ships OpenVINO and oneTBB without their notices; OpenVINO's
+# third-party programs file covers oneTBB.
+fetch "https://raw.githubusercontent.com/openvinotoolkit/openvino/$OPENVINO_VERSION/LICENSE" \
+  "$CACHE/licenses/OPENVINO-LICENSE" c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4
+fetch "https://raw.githubusercontent.com/openvinotoolkit/openvino/$OPENVINO_VERSION/licensing/third-party-programs.txt" \
+  "$CACHE/licenses/OPENVINO-THIRD-PARTY-PROGRAMS.txt" 687a0c5323cddd59f361dd9819dd5f48dddd967b0c1770c75d1085843407ecb4
 
 export CARGO_HOME="$CACHE/cargo"
 export RUSTUP_HOME="$CACHE/rustup"

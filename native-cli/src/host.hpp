@@ -7,7 +7,7 @@
 namespace aihider {
 class Analyzer {
 public:
-    explicit Analyzer(fs::path home, Backend backend = Backend::Auto);
+    explicit Analyzer(fs::path home, BackendOptions options = {});
     ~Analyzer();
     Json ping();
     Json analyze(const std::string& text);
@@ -20,6 +20,6 @@ std::vector<std::vector<uint32_t>> windows(const std::vector<uint32_t>& ids);
 Json validate_request(const Json& request);
 bool read_frame(std::istream& stream, Json& message);
 void write_frame(std::ostream& stream, const Json& message);
-int serve(const fs::path& home, Backend backend = Backend::Auto);
+int serve(const fs::path& home, BackendOptions options = {});
 void self_test();
 }

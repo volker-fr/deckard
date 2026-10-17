@@ -3,6 +3,10 @@
 #include "gradient_backend.hpp"
 #include "tokenizer.hpp"
 #include "setup.hpp"
+#if defined(__linux__)
+#include "onnx_providers.hpp"
+#include "system_check.hpp"
+#endif
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -33,7 +37,7 @@ Options options(int argc, char** argv, int start) {
                                       "--file", "--model", "--fixtures", "--output", "--source",
                                       "--extension-dir", "--shell", "--cache-dir"};
     const std::set<std::string> flags{"--replace", "--no-register", "--no-extension", "--no-download", "--onnx",
-                                      "--candle"};
+                                      "--candle", "--gpu"};
     Options result;
     for (int i = start; i < argc; ++i) {
         std::string key = argv[i];
@@ -46,18 +50,22 @@ Options options(int argc, char** argv, int start) {
     }
     return result;
 }
-// --onnx and --candle choose the Linux runtime (see gradient_backend.hpp).
+// --onnx and --candle choose the Linux runtime, --gpu lets ONNX Runtime try
+// the Intel GPU (see BackendOptions in gradient_backend.hpp).
 std::set<std::string> with_backend_options(std::set<std::string> allowed) {
 #if defined(__linux__)
-    allowed.insert({"--onnx", "--candle"});
+    allowed.insert({"--onnx", "--candle", "--gpu"});
 #endif
     return allowed;
 }
-Backend backend_for(const Options& options) {
+BackendOptions backend_options_for(const Options& options) {
     if (options.has("--onnx") && options.has("--candle")) throw Error("arguments", "Choose either --onnx or --candle.");
-    if (options.has("--onnx")) return Backend::Onnx;
-    if (options.has("--candle")) return Backend::Candle;
-    return Backend::Auto;
+    if (options.has("--gpu") && options.has("--candle")) throw Error("arguments", "--gpu needs ONNX Runtime, not --candle.");
+    BackendOptions result;
+    if (options.has("--onnx")) result.backend = Backend::Onnx;
+    if (options.has("--candle")) result.backend = Backend::Candle;
+    result.gpu = options.has("--gpu");
+    return result;
 }
 void allow_options(const Options& options, const std::set<std::string>& allowed) {
     for (const auto& item : options.values)
@@ -182,7 +190,8 @@ void install(const Options& options) {
     std::set<std::string> allowed{"--home", "--extension-id", "--manifest-dir", "--model-dir",
                                   "--replace", "--no-register", "--extension-dir", "--shell", "--no-extension"};
 #if defined(__linux__)
-    allowed.insert("--no-download");  // Linux downloads the model; see model_source().
+    // Linux downloads the model; see model_source(). --gpu: see BackendOptions.
+    allowed.insert({"--no-download", "--gpu"});
 #endif
     allow_options(options, allowed);
     if (options.has("--extension-dir") && options.has("--no-extension"))
@@ -261,6 +270,8 @@ void install(const Options& options) {
     fs::create_directory(runtime / "share");
     fs::copy(distribution / "share/licenses", runtime / "share/licenses", fs::copy_options::recursive);
     const fs::path source = model_source(options, distribution);
+    if (options.has("--gpu") && !fs::is_regular_file(source / "model.onnx"))
+        throw Error("arguments", "--gpu runs model.onnx on the GPU; export it first (scripts/export-onnx.sh).");
     for (auto it = model_assets().at("files").begin(); it != model_assets().at("files").end(); ++it) {
         const auto destination = runtime / "models" / it.key();
         fs::create_directories(destination.parent_path());
@@ -292,6 +303,15 @@ void install(const Options& options) {
     // or removing it and installing again reuses the old release. Omitted when
     // absent, so those releases keep their names.
     if (!installed_optional.empty()) config["optional_model_files"] = installed_optional;
+#if defined(__linux__)
+    // The Chrome-launched host reads this opt-in (host.cpp).
+    if (options.has("--gpu")) {
+        config["onnx_gpu"] = true;
+        if (!accelerator_available(model_cache()))
+            std::cout << "Warning: no usable Intel GPU was found, so Deckard will run model.onnx on the CPU.\n"
+                         "Run deckard check-system for the missing driver or library.\n";
+    }
+#endif
     config["license_files"] = Json::array();
     config["license_sha256"] = Json::object();
     for (const auto& entry : fs::recursive_directory_iterator(runtime / "share/licenses"))
@@ -630,7 +650,7 @@ void verify(const Options& options) {
     auto started = std::chrono::steady_clock::now();
     std::unique_ptr<ModelBackend> model(create_model_backend(
         options.get("--model"),
-        options.has("--cache-dir") ? fs::absolute(options.get("--cache-dir")) : model_cache(), backend_for(options)));
+        options.has("--cache-dir") ? fs::absolute(options.get("--cache-dir")) : model_cache(), backend_options_for(options)));
     double load = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
     Json rows = Json::array();
     double logit_error = 0, score_error = 0;
@@ -656,7 +676,8 @@ void verify(const Options& options) {
                    {"max_logit_error", logit_error}, {"max_score_error", score_error}, {"load_ms", load},
                    {"same_default_decisions", same_decisions}, {"score_tolerance", 0.002},
                    {"runtime", model->runtime()}, {"scheduling", "default"},
-                   {"compute_units", native_compute_units}, {"model_assets_sha256", model_assets_id()},
+                   {"compute_units", native_compute_units}, {"device", model->device()},
+                   {"model_assets_sha256", model_assets_id()},
                    {"source_weights_sha256", packed_sha},
                    {"fixtures_sha256", sha256(options.get("--fixtures"))}};
     if (options.has("--output")) {
@@ -672,16 +693,22 @@ constexpr const char* help_install_model =
     "  Uses the prebuilt Core ML model and extension from the release bundle by default.\n";
 constexpr const char* help_backend_flags = "";
 constexpr const char* help_backends = "";
+constexpr const char* help_check_system = "";
 #else
 constexpr const char* help_title = "native Gradient/Candle for Linux x86_64";
-constexpr const char* help_install_flags = " [--no-download]";
+constexpr const char* help_install_flags = " [--no-download] [--gpu]";
 constexpr const char* help_install_model =
     "  Downloads the pinned model into ~/.cache/deckard unless --model-dir is given;\n"
-    "  --no-download uses only files already there.\n";
-constexpr const char* help_backend_flags = " [--onnx | --candle]";
+    "  --no-download uses only files already there. --gpu lets the host run model.onnx\n"
+    "  on an Intel GPU (OpenVINO) when usable.\n";
+constexpr const char* help_backend_flags = " [--onnx | --candle] [--gpu]";
 constexpr const char* help_backends =
     "  With model.onnx installed, ONNX Runtime serves inference and Candle takes over if it\n"
-    "  fails; otherwise Candle does. --onnx or --candle forces one runtime without fallback.\n";
+    "  fails; otherwise Candle does. --onnx or --candle forces one runtime without fallback.\n"
+    "  --gpu tries the Intel GPU first (see deckard check-system).\n";
+constexpr const char* help_check_system =
+    "deckard check-system\n"
+    "  Report models, runtimes, Intel GPU drivers and accelerators, with fixes for missing pieces.\n";
 #endif
 void help() {
     std::cout <<
@@ -705,7 +732,7 @@ void help() {
         "  Score UTF-8 text from a file or stdin and print JSON; no page text is logged.\n\n"
         "deckard verify --model DIR --fixtures FILE [--output FILE] [--cache-dir DIR]" << help_backend_flags << "\n"
         << help_backends <<
-        "deckard self-test\n";
+        "deckard self-test\n" << help_check_system;
 }
 }
 }
@@ -732,7 +759,7 @@ int main(int argc, char** argv) {
         else if (command == "uninstall") uninstall(args);
         else if (command == "start") {
             allow_options(args, with_backend_options({"--home"}));
-            return serve(home_for(args), backend_for(args));
+            return serve(home_for(args), backend_options_for(args));
         } else if (command == "status") {
             allow_options(args, {"--home"});
             auto config = installed_config(home_for(args), true);
@@ -749,9 +776,15 @@ int main(int argc, char** argv) {
                     if (text.size() > 80000) throw Error("invalid_text", "Text exceeds the byte limit.");
                 }
             } else text = read_text(args.get("--file"), 80000);
-            Analyzer analyzer(home_for(args), backend_for(args));
+            Analyzer analyzer(home_for(args), backend_options_for(args));
             std::cout << analyzer.analyze(text).dump(2) << '\n';
         } else if (command == "verify") verify(args);
+#if defined(__linux__)
+        else if (command == "check-system") {
+            allow_options(args, {});
+            std::cout << system_check().dump(2) << '\n';
+        }
+#endif
         else if (command == "self-test") {
             allow_options(args, {});
             self_test();

@@ -39,28 +39,55 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${ONNX_ASSETS_FI
 file(READ "${ONNX_ASSETS_FILE}" ONNX_ASSETS_JSON)
 configure_file(src/onnx_assets.hpp.in "${CMAKE_CURRENT_BINARY_DIR}/generated/onnx_assets.hpp" @ONLY)
 
-# Embeds the ONNX Runtime library as the read-only symbols
-# _binary_onnxruntime_bin_start/_end; onnx_runtime.cpp checks the copy it
-# writes out against ONNXRUNTIME_SHA256. The version must match bootstrap-linux.sh.
+# ONNX Runtime and OpenVINO from the onnxruntime-openvino wheel; the versions
+# must match bootstrap-linux.sh.
 set(ONNXRUNTIME_VERSION 1.24.1)
+set(OPENVINO_VERSION 2025.4.1)
+# OpenVINO 2025.4.1 names its libraries *.so.2541.
+string(SUBSTRING "${OPENVINO_VERSION}" 2 -1 OPENVINO_SO)
+string(REPLACE "." "" OPENVINO_SO "${OPENVINO_SO}")
 set(ONNXRUNTIME "${NATIVE_CACHE}/onnxruntime-${ONNXRUNTIME_VERSION}")
-set(ONNXRUNTIME_LIBRARY "${ONNXRUNTIME}/lib/libonnxruntime.so.${ONNXRUNTIME_VERSION}")
-set(ONNXRUNTIME_OBJECT "${CMAKE_CURRENT_BINARY_DIR}/onnxruntime.o")
-add_custom_command(
-  OUTPUT "${ONNXRUNTIME_OBJECT}"
-  COMMAND "${CMAKE_COMMAND}" -E copy "${ONNXRUNTIME_LIBRARY}" onnxruntime.bin
-  COMMAND objcopy -I binary -O elf64-x86-64 -B i386:x86-64
-    --rename-section .data=.rodata,alloc,load,readonly,data,contents onnxruntime.bin onnxruntime.o
-  COMMAND "${CMAKE_COMMAND}" -E remove onnxruntime.bin
-  WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
-  DEPENDS "${ONNXRUNTIME_LIBRARY}"
-  VERBATIM)
-set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${ONNXRUNTIME_LIBRARY}")
-file(SHA256 "${ONNXRUNTIME_LIBRARY}" ONNXRUNTIME_SHA256)
-set_source_files_properties(src/onnx_runtime.cpp PROPERTIES
-  COMPILE_DEFINITIONS "ONNXRUNTIME_VERSION=\"${ONNXRUNTIME_VERSION}\";ONNXRUNTIME_SHA256=\"${ONNXRUNTIME_SHA256}\"")
 
-set(DECKARD_PLATFORM_SOURCES src/onnx_runtime.cpp src/onnx_gradient.cpp "${ONNXRUNTIME_OBJECT}")
+# Embeds each library as the read-only symbols _binary_<name>_bin_start/_end
+# and lists it as DECKARD_EMBEDDED(name, "file", "sha256") in
+# generated/embedded_libraries.inc; onnx_runtime.cpp writes them next to each
+# other and checks each copy against its SHA-256. The core comes first.
+set(EMBEDDED "${CMAKE_CURRENT_BINARY_DIR}/embedded")
+file(MAKE_DIRECTORY "${EMBEDDED}")
+set(EMBEDDED_OBJECTS)
+set(EMBEDDED_ENTRIES "")
+foreach(entry
+    "onnxruntime:libonnxruntime.so.${ONNXRUNTIME_VERSION}"
+    "ort_providers_shared:libonnxruntime_providers_shared.so"
+    "ort_provider_openvino:libonnxruntime_providers_openvino.so"
+    "openvino:libopenvino.so.${OPENVINO_SO}"
+    "openvino_onnx_frontend:libopenvino_onnx_frontend.so.${OPENVINO_SO}"
+    "openvino_intel_gpu_plugin:libopenvino_intel_gpu_plugin.so"
+    "tbb:libtbb.so.12"
+    "tbbmalloc:libtbbmalloc.so")
+  string(REPLACE ":" ";" entry "${entry}")
+  list(GET entry 0 name)
+  list(GET entry 1 file)
+  set(library "${ONNXRUNTIME}/lib/${file}")
+  set(object "${EMBEDDED}/${name}.o")
+  # objcopy names the symbols after its input path, so it runs next to it.
+  add_custom_command(OUTPUT "${object}"
+    COMMAND "${CMAKE_COMMAND}" -E copy "${library}" "${name}.bin"
+    COMMAND objcopy -I binary -O elf64-x86-64 -B i386:x86-64
+      --rename-section .data=.rodata,alloc,load,readonly,data,contents "${name}.bin" "${name}.o"
+    COMMAND "${CMAKE_COMMAND}" -E remove "${name}.bin"
+    WORKING_DIRECTORY "${EMBEDDED}" DEPENDS "${library}" VERBATIM)
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${library}")
+  file(SHA256 "${library}" sha256)
+  list(APPEND EMBEDDED_OBJECTS "${object}")
+  string(APPEND EMBEDDED_ENTRIES "DECKARD_EMBEDDED(${name}, \"${file}\", \"${sha256}\")\n")
+endforeach()
+file(CONFIGURE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/generated/embedded_libraries.inc" CONTENT "${EMBEDDED_ENTRIES}" @ONLY)
+set_source_files_properties(src/onnx_runtime.cpp PROPERTIES
+  COMPILE_DEFINITIONS "ONNXRUNTIME_VERSION=\"${ONNXRUNTIME_VERSION}\";OPENVINO_VERSION=\"${OPENVINO_VERSION}\"")
+
+set(DECKARD_PLATFORM_SOURCES src/onnx_runtime.cpp src/onnx_providers.cpp src/onnx_gradient.cpp
+  src/intel_gpu.cpp src/system_check.cpp ${EMBEDDED_OBJECTS})
 set(DECKARD_PLATFORM_INCLUDES "${ONNXRUNTIME}/include")
 # SHA-256 comes from OpenSSL's libcrypto EVP API on Linux (CommonCrypto on
 # macOS). The Rust staticlibs' std needs libdl on glibc older than 2.34.

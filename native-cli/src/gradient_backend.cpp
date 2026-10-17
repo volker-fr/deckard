@@ -21,13 +21,16 @@ namespace {
 template <typename Runtime>
 class RuntimeBackend : public ModelBackend {
  public:
-  RuntimeBackend(const std::filesystem::path& model_directory,
-                 const std::filesystem::path& cache_directory)
-      : runtime_(model_directory, cache_directory) {}
+  template <typename... Arguments>
+  explicit RuntimeBackend(Arguments&&... arguments) : runtime_(std::forward<Arguments>(arguments)...) {}
 
   double logit(const std::vector<std::uint32_t>& ids,
                const std::vector<std::uint32_t>& mask) override {
     return runtime_.logit(ids, mask);
+  }
+  const char* device() const override {
+    if constexpr (requires { runtime_.device(); }) return runtime_.device();
+    return ModelBackend::device();
   }
   const char* runtime() const override {
     if constexpr (requires { runtime_.runtime(); }) return runtime_.runtime();
@@ -72,6 +75,7 @@ class AutoBackend : public ModelBackend {
     }
     return candle_->logit(ids, mask);
   }
+  const char* device() const override { return onnx_ ? onnx_->device() : candle_->device(); }
   const char* runtime() const override { return onnx_ ? onnx_->runtime() : candle_->runtime(); }
 
  private:
@@ -89,6 +93,7 @@ class AutoBackend : public ModelBackend {
 
 }  // namespace
 
+const char* ModelBackend::device() const { return native_compute_units; }
 const char* ModelBackend::runtime() const { return runtime_id; }
 
 Backend resolve_backend(const std::filesystem::path& model_directory, Backend backend) {
@@ -99,16 +104,16 @@ Backend resolve_backend(const std::filesystem::path& model_directory, Backend ba
 std::unique_ptr<ModelBackend> create_model_backend(
     const std::filesystem::path& model_directory,
     const std::filesystem::path& cache_directory,
-    Backend backend) {
+    const BackendOptions& options) {
 #if defined(__APPLE__)
-  (void)backend;
+  (void)options;
   return std::make_unique<RuntimeBackend<CoreMLGradient>>(model_directory, cache_directory);
 #else
-  if (backend == Backend::Onnx)
-    return std::make_unique<RuntimeBackend<OnnxGradient>>(model_directory, cache_directory);
-  if (resolve_backend(model_directory, backend) == Backend::Onnx)
+  if (options.backend == Backend::Onnx)
+    return std::make_unique<RuntimeBackend<OnnxGradient>>(model_directory, cache_directory, options.gpu);
+  if (resolve_backend(model_directory, options.backend) == Backend::Onnx)
     return make_auto_backend(
-        [=] { return std::make_unique<RuntimeBackend<OnnxGradient>>(model_directory, cache_directory); },
+        [=] { return std::make_unique<RuntimeBackend<OnnxGradient>>(model_directory, cache_directory, options.gpu); },
         [=] { return std::make_unique<RuntimeBackend<CandleGradient>>(model_directory, cache_directory); },
         std::cerr);
   return std::make_unique<RuntimeBackend<CandleGradient>>(model_directory, cache_directory);
