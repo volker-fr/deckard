@@ -7,6 +7,7 @@ import "../core.js";
 const source = fs.readFileSync(new URL("../popup.js", import.meta.url), "utf8");
 const html = fs.readFileSync(new URL("../popup.html", import.meta.url), "utf8");
 async function harness({ enabled = false, granted = true, flagThreshold = globalThis.DeckardCore.FLAG_THRESHOLD, excludedSites = [],
+  platform = "mac", platformInfo,
   tab = { id: 1, url: "https://example.com", title: "Example" } } = {}) {
   const element = () => ({
     textContent: "", checked: false, disabled: true, events: {}, children: [],
@@ -20,6 +21,7 @@ async function harness({ enabled = false, granted = true, flagThreshold = global
   const chrome = {
     runtime: {
       id: "test-id",
+      getPlatformInfo: platformInfo || (async () => ({ os: platform })),
       sendMessage: async message => {
         calls.push(message);
         if (message.type === "SET_ENABLED") enabled = message.enabled;
@@ -64,8 +66,55 @@ test("popup has an On/Off switch, site exclusion, threshold slider, and read-onl
   assert.equal(h.elements.get("toggle-label").textContent, "Off");
   assert.equal(h.calls.some(call => call.permission || call.type === "PING"), false);
   assert.equal(h.elements.get("install-command").textContent,
-    '"$HOME/Library/Application Support/Deckard/current/bin/deckard" install --extension-id test-id');
+    '"$HOME/Deckard/current/bin/deckard" install --extension-id test-id');
   assert.equal(h.elements.get("setup").hidden, true);
+});
+
+test("repair commands use the current Linux and macOS default installation paths", async () => {
+  for (const [platform, prefix] of [["linux", ".local/share/deckard"], ["mac", "Deckard"]]) {
+    const h = await harness({ platform });
+    assert.equal(h.elements.get("install-command").textContent,
+      `"$HOME/${prefix}/current/bin/deckard" install --extension-id test-id`);
+    assert.equal(h.elements.get("install-command-row").hidden, false);
+    assert.match(h.elements.get("install-help").textContent, /custom or older installation/);
+    assert.match(h.elements.get("install-help").textContent, /custom install options/);
+    assert.equal(h.calls.some(call => call.permission), false);
+  }
+});
+
+test("unsupported platforms explain helper support instead of suggesting a macOS command", async () => {
+  for (const platform of ["win", "cros", "openbsd"]) {
+    const h = await harness({ platform });
+    assert.equal(h.elements.get("install-command").textContent, "");
+    assert.equal(h.elements.get("install-command-row").hidden, true);
+    assert.match(h.elements.get("install-help").textContent, /supports macOS and Linux/);
+    assert.equal(h.elements.get("enabled").disabled, false);
+  }
+});
+
+test("delayed platform detection does not block the popup or show an unverified command", async () => {
+  let resolvePlatform;
+  const h = await harness({ enabled: true, platformInfo: () => new Promise(resolve => { resolvePlatform = resolve; }) });
+  assert.equal(h.elements.get("enabled").checked, true);
+  assert.equal(h.elements.get("enabled").disabled, false);
+  assert.equal(h.elements.get("install-command-row").hidden, true);
+  assert.equal(h.elements.get("install-command").textContent, "");
+  assert.match(h.elements.get("install-help").textContent, /Checking/);
+  resolvePlatform({ os: "linux" });
+  await h.settle();
+  assert.equal(h.elements.get("install-command-row").hidden, false);
+  assert.match(h.elements.get("install-command").textContent, /\.local\/share\/deckard/);
+  assert.equal(h.elements.get("enabled").checked, true);
+});
+
+test("platform detection failure offers a PATH fallback without replacing page status", async () => {
+  const h = await harness({ platformInfo: async () => { throw new Error("Platform lookup failed."); } });
+  assert.equal(h.elements.get("install-command").textContent, "deckard install --extension-id test-id");
+  assert.equal(h.elements.get("install-command-row").hidden, false);
+  assert.match(h.elements.get("install-help").textContent, /Could not detect this platform/);
+  assert.match(h.elements.get("install-help").textContent, /on PATH/);
+  assert.doesNotMatch(h.elements.get("status").textContent, /Platform lookup failed/);
+  assert.equal(h.elements.get("enabled").disabled, false);
 });
 
 test("site exclusion is reversible, hostname-scoped, and does not ask for permissions", async () => {

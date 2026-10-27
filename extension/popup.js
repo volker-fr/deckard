@@ -3,7 +3,27 @@
   const C = globalThis.DeckardCore;
   const $ = id => document.getElementById(id);
   $("extension-id").textContent = chrome.runtime.id;
-  $("install-command").textContent = `"$HOME/Library/Application Support/Deckard/current/bin/deckard" install --extension-id ${chrome.runtime.id}`;
+  async function prepareInstallCommand() {
+    $("install-command-row").hidden = true;
+    $("install-command").textContent = "";
+    $("install-help").textContent = "Checking this platform…";
+    try {
+      const { os } = await chrome.runtime.getPlatformInfo();
+      const prefix = os === "mac" ? "$HOME/Deckard" : os === "linux" ? "$HOME/.local/share/deckard" : null;
+      if (!prefix) {
+        $("install-help").textContent = "The native helper supports macOS and Linux. Install Deckard on a supported platform.";
+        return;
+      }
+      $("install-command").textContent = `"${prefix}/current/bin/deckard" install --extension-id ${chrome.runtime.id}`;
+      $("install-command-row").hidden = false;
+      $("install-help").textContent = "For a custom or older installation, replace the executable path with that installation's current/bin/deckard. Keep any custom install options.";
+    } catch {
+      $("install-command").textContent = `deckard install --extension-id ${chrome.runtime.id}`;
+      $("install-command-row").hidden = false;
+      $("install-help").textContent = "Could not detect this platform. If Deckard is on PATH, run this in your terminal; otherwise use your installation's current/bin/deckard path.";
+    }
+  }
+  void prepareInstallCommand();
   let tabId;
   let hostname;
   let busy = false;
