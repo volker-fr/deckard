@@ -125,7 +125,7 @@ for (const shell of ["zsh", "bash"]) for (const original of [null, "", "export P
 
 test("a symlinked shell profile is refused with its path and a --shell none hint", { skip: !available }, t => {
   const f = fixture(t);
-  const target = path.join(f.user, "dotfiles-zshrc");
+  const target = path.join(f.user, "shell-profile-target");
   fs.writeFileSync(target, "# managed elsewhere\n");
   fs.symlinkSync(target, f.profile);
   const refused = f.install();
@@ -140,7 +140,7 @@ test("a symlinked shell profile is refused with its path and a --shell none hint
 
 test("a Chrome manifest directory behind a user-owned symlink is resolved, not refused", { skip: !available }, t => {
   const f = fixture(t);
-  const real = path.join(f.root, "dotfiles/chrome");
+  const real = path.join(f.root, "real-chrome-profile");
   fs.mkdirSync(path.join(real, "NativeMessagingHosts"), { recursive: true });
   const linked = path.join(f.user, "chrome-link");
   fs.symlinkSync(real, linked);

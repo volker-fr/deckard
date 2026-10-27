@@ -4,8 +4,9 @@
 
 namespace aihider {
 bool path_present(const fs::path& path);
-// Rejects symlinks and hard links anywhere along `path`. `hint` is appended to
-// the conflict message to tell the user how to avoid the check.
+// Existing directories along `path` must be real directories. A final file
+// must be regular with a single hard link. `hint` is appended to the conflict
+// message to tell the user how to avoid the check.
 void require_plain_path(const fs::path& path, bool directory, const std::string& hint = "");
 // Chrome's NativeMessagingHosts directory belongs to Chrome, not Deckard, and
 // is often reached through a dotfile-manager symlink (for example

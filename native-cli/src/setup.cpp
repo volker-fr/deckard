@@ -1,5 +1,6 @@
 #include "setup.hpp"
 #include <algorithm>
+#include <cerrno>
 #include <fcntl.h>
 #include <fstream>
 #include <set>
@@ -128,17 +129,34 @@ void require_plain_path(const fs::path& path, bool directory, const std::string&
     }
 }
 fs::path resolve_trusted_symlinks(const fs::path& path) {
-    const auto absolute = fs::absolute(path).lexically_normal();
-    fs::path current = absolute.root_path();
-    for (const auto& part : absolute.relative_path()) {
-        current /= part;
-        struct stat info {};
-        if (lstat(current.c_str(), &info) != 0 || !S_ISLNK(info.st_mode)) continue;
-        if (info.st_uid != getuid() && info.st_uid != 0)
-            conflict("Setup follows only symlinks owned by you or root: " + current.string() + ".");
-        current = fs::canonical(current);
-    }
-    return current;
+    size_t followed = 0;
+    const auto resolve = [&](const auto& self, const fs::path& candidate, bool target) -> fs::path {
+        fs::path current = candidate.root_path();
+        for (const auto& part : candidate.relative_path()) {
+            current /= part;
+            struct stat info {};
+            if (lstat(current.c_str(), &info) != 0) {
+                // A new manifest directory may have a missing suffix, but a
+                // symlink target must exist, just as with canonical().
+                const auto error = std::error_code(errno, std::generic_category());
+                if (!target && error == std::errc::no_such_file_or_directory) continue;
+                throw fs::filesystem_error("Cannot resolve setup path", current, error);
+            }
+            if (!S_ISLNK(info.st_mode)) {
+                // Normalize parent components only after the filesystem has
+                // resolved them; a preceding symlink may change their meaning.
+                current = current.lexically_normal();
+                continue;
+            }
+            if (info.st_uid != getuid() && info.st_uid != 0)
+                conflict("Setup follows only symlinks owned by you or root: " + current.string() + ".");
+            if (++followed > 40) conflict("Too many symlinks in setup path: " + current.string() + ".");
+            const auto destination = fs::read_symlink(current);
+            current = self(self, destination.is_absolute() ? destination : current.parent_path() / destination, true);
+        }
+        return current;
+    };
+    return resolve(resolve, fs::absolute(path).lexically_normal(), false);
 }
 void validate_prefix(const fs::path& prefix) {
     safe_string(prefix.string());
