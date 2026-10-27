@@ -17,7 +17,8 @@ HOST=x86_64-unknown-linux-gnu
 TOOLCHAIN="$CACHE/rustup/toolchains/1.90.0-$HOST"
 # ONNX Runtime; the version must match linux.cmake.
 ORT_VERSION=1.24.1
-ORT="$CACHE/onnxruntime-$ORT_VERSION"
+# Distribution namespacing also keeps notices separate from OpenVINO builds.
+ORT="$CACHE/onnxruntime-cpu-$ORT_VERSION"
 
 fail() { echo "$*" >&2; exit 1; }
 
@@ -39,13 +40,22 @@ require_pinned_toolchain() {
   esac
 }
 
+require_cpu_runtime() {
+  (cd "$ORT" && sha256sum --check "$ROOT/native-cli/onnxruntime-cpu.sha256") ||
+    fail "The official CPU runtime has a checksum mismatch. Re-run bootstrap with a writable cache."
+}
+
 if [ "$CACHE" != "$ROOT/cache/native-build" ]; then
   for required in json/include/nlohmann/json.hpp cargo/registry "rustup/toolchains/1.90.0-$HOST/bin/cargo" \
-    licenses/NLOHMANN-LICENSE "onnxruntime-$ORT_VERSION/include/onnxruntime_c_api.h" licenses/ONNXRUNTIME-LICENSE \
-    "onnxruntime-$ORT_VERSION/lib/libonnxruntime.so.$ORT_VERSION" licenses/ONNXRUNTIME-THIRD-PARTY-NOTICES.txt; do
+    licenses/NLOHMANN-LICENSE "onnxruntime-cpu-$ORT_VERSION/include/onnxruntime_c_api.h" \
+    "onnxruntime-cpu-$ORT_VERSION/include/onnxruntime_ep_c_api.h" \
+    "onnxruntime-cpu-$ORT_VERSION/lib/libonnxruntime.so.$ORT_VERSION" \
+    "onnxruntime-cpu-$ORT_VERSION/licenses/ONNXRUNTIME-LICENSE" \
+    "onnxruntime-cpu-$ORT_VERSION/licenses/ONNXRUNTIME-THIRD-PARTY-NOTICES.txt"; do
     [ -e "$CACHE/$required" ] || fail "External NATIVE_CACHE is read-only and incomplete: $required"
   done
   require_pinned_toolchain
+  require_cpu_runtime
   echo "Using existing read-only native dependencies in $CACHE"
   exit 0
 fi
@@ -76,13 +86,16 @@ fetch 'https://huggingface.co/ShantanuT01/gradient-ai-text-detector/raw/c2e8b6df
 ORT_ARCHIVE="onnxruntime-linux-x64-$ORT_VERSION"
 fetch "https://github.com/microsoft/onnxruntime/releases/download/v$ORT_VERSION/$ORT_ARCHIVE.tgz" \
   "$DOWNLOADS/$ORT_ARCHIVE.tgz" 9142552248b735920f9390027e4512a2cacf8946a1ffcbe9071a5c210531026f
-mkdir -p "$ORT"
-tar -xzf "$DOWNLOADS/$ORT_ARCHIVE.tgz" -C "$ORT" --strip-components=1 \
-  "$ORT_ARCHIVE/include" "$ORT_ARCHIVE/lib/libonnxruntime.so.$ORT_VERSION"
-tar -xOzf "$DOWNLOADS/$ORT_ARCHIVE.tgz" "$ORT_ARCHIVE/LICENSE" \
-  > "$CACHE/licenses/ONNXRUNTIME-LICENSE"
-tar -xOzf "$DOWNLOADS/$ORT_ARCHIVE.tgz" "$ORT_ARCHIVE/ThirdPartyNotices.txt" \
-  > "$CACHE/licenses/ONNXRUNTIME-THIRD-PARTY-NOTICES.txt"
+mkdir -p "$ORT/licenses"
+if ! (cd "$ORT" && sha256sum --check --status "$ROOT/native-cli/onnxruntime-cpu.sha256" 2>/dev/null); then
+  tar -xzf "$DOWNLOADS/$ORT_ARCHIVE.tgz" -C "$ORT" --strip-components=1 \
+    "$ORT_ARCHIVE/include" "$ORT_ARCHIVE/lib/libonnxruntime.so.$ORT_VERSION"
+  tar -xOzf "$DOWNLOADS/$ORT_ARCHIVE.tgz" "$ORT_ARCHIVE/LICENSE" \
+    > "$ORT/licenses/ONNXRUNTIME-LICENSE"
+  tar -xOzf "$DOWNLOADS/$ORT_ARCHIVE.tgz" "$ORT_ARCHIVE/ThirdPartyNotices.txt" \
+    > "$ORT/licenses/ONNXRUNTIME-THIRD-PARTY-NOTICES.txt"
+fi
+require_cpu_runtime
 
 export CARGO_HOME="$CACHE/cargo"
 export RUSTUP_HOME="$CACHE/rustup"

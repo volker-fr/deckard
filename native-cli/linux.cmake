@@ -43,7 +43,11 @@ configure_file(src/onnx_assets.hpp.in "${CMAKE_CURRENT_BINARY_DIR}/generated/onn
 # _binary_onnxruntime_bin_start/_end; onnx_runtime.cpp checks the copy it
 # writes out against ONNXRUNTIME_SHA256. The version must match bootstrap-linux.sh.
 set(ONNXRUNTIME_VERSION 1.24.1)
-set(ONNXRUNTIME "${NATIVE_CACHE}/onnxruntime-${ONNXRUNTIME_VERSION}")
+set(ONNXRUNTIME "${NATIVE_CACHE}/onnxruntime-cpu-${ONNXRUNTIME_VERSION}")
+set(ONNXRUNTIME_PINS "${CMAKE_CURRENT_SOURCE_DIR}/onnxruntime-cpu.sha256")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${ONNXRUNTIME_PINS}")
+include("${CMAKE_CURRENT_SOURCE_DIR}/verify-onnxruntime.cmake")
+set(PLATFORM_NOTICE_DIRECTORY "${ONNXRUNTIME}/licenses")
 set(ONNXRUNTIME_LIBRARY "${ONNXRUNTIME}/lib/libonnxruntime.so.${ONNXRUNTIME_VERSION}")
 set(ONNXRUNTIME_OBJECT "${CMAKE_CURRENT_BINARY_DIR}/onnxruntime.o")
 add_custom_command(

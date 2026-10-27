@@ -1,0 +1,18 @@
+# Shared with bootstrap-linux.sh: a renamed OpenVINO core must not be embedded
+# as the official CPU distribution, even when CMake is run without bootstrap.
+file(STRINGS "${ONNXRUNTIME_PINS}" pins)
+if(NOT pins)
+  message(FATAL_ERROR "Official CPU runtime checksum pins are missing.")
+endif()
+foreach(pin IN LISTS pins)
+  if(NOT pin MATCHES "^([0-9a-f]+)  (.+)$")
+    message(FATAL_ERROR "Invalid official CPU runtime checksum pin: ${pin}")
+  endif()
+  set(expected "${CMAKE_MATCH_1}")
+  set(asset "${ONNXRUNTIME}/${CMAKE_MATCH_2}")
+  file(SHA256 "${asset}" actual)
+  if(NOT actual STREQUAL expected)
+    message(FATAL_ERROR "The official CPU runtime has a checksum mismatch: ${asset}. Re-run bootstrap with a writable cache.")
+  endif()
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${asset}")
+endforeach()

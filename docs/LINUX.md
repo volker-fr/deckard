@@ -43,6 +43,16 @@ tgz: C headers, pre-compiled library, license notices; the version is set in
 `bootstrap-linux.sh` and `linux.cmake`). `linux.cmake` embeds the library in
 `deckard` with `objcopy` (from binutils, which compilers usually pull in).
 
+The official CPU distribution is cached in
+`cache/native-build/onnxruntime-cpu-<version>/`, including its license notices.
+This is separate from caches used by OpenVINO builds, so switching branches
+does not overwrite another distribution's library or notices. Bootstrap and
+CMake verify the consumed C API headers, library and notices against
+`native-cli/onnxruntime-cpu.sha256`, including for a read-only `NATIVE_CACHE`.
+An older external cache needs the new directory populated by bootstrap before
+it can be used read-only. Downloaded archives remain reusable; runtime files
+under `~/.cache/deckard` and installed releases are unchanged.
+
 ## Install
 
 From the repository root:
