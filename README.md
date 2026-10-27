@@ -62,20 +62,24 @@ npm test
 ```
 
 Extension tests need no npm dependencies. Native tests/builds require the native
-toolchain and fixtures; release users do not. On a supported Mac, with a
-prepared dependency cache and canonical quantized model directory:
+toolchain and fixtures; release users do not. For Linux builds, installation
+and native tests, see [Deckard on Linux](docs/LINUX.md). Linux source installs
+download the pinned FP32 checkpoint when `--model-dir` is omitted; the optional
+ONNX export is a separate step described there.
+
+On a supported Mac, with a prepared dependency cache and Core ML model directory:
 
 ```sh
 NATIVE_CACHE=/path/to/native-build scripts/build-native.sh
-DECKARD_MODEL_DIR=/path/to/canonical/mlx-q4 npm run test:native
-scripts/package-release.sh --model-dir /path/to/canonical/mlx-q4
+DECKARD_MODEL_DIR=/path/to/canonical/coreml npm run test:native
+scripts/package-release.sh --model-dir /path/to/canonical/coreml
 ```
 
 The build reads the external dependency cache without modifying it. Packaging
 also accepts `--native-dist native-cli/build/dist` and
 `--output-dir dist/v0.6.4`. These are maintainer steps, not evidence that a
-release has been published. Release archives bundle prepared model assets;
-source installs must pass `--model-dir` explicitly. The installer does not
+release has been published. Release archives bundle prepared model assets.
+On macOS, source installs must pass `--model-dir` explicitly; they do not
 download or convert upstream FP32 weights automatically.
 Without `DECKARD_MODEL_DIR`, native model-installation tests are explicitly
 skipped; protocol and ownership-refusal tests still run against the built CLI.
