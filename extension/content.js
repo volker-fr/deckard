@@ -13,6 +13,8 @@
   const flagClass = `deckard-marked-${suffix}`;
   const records = new Map();
   const processed = new Map();
+  // Local results counted in this scan; DOM findings may merge local/context marks.
+  let countedLocalResults = [];
   const classOwners = new Map();
   const rangeOwners = new Map();
   const contextProcessed = new Map();
@@ -42,7 +44,7 @@
   const structuralRecords = new Set();
   let currentURL = location.href;
   let sheet;
-  let status = { state: "idle", analyzed: 0, partial: 0, skipped: 0, marked: 0, limited: false,
+  let status = { state: "idle", analyzed: 0, belowThreshold: 0, partial: 0, skipped: 0, marked: 0, limited: false,
     scannedWords: 0, totalWords: 0, usedWords: 0, findings: [], detail: "" };
   const view = window;
   async function request(message) {
@@ -79,6 +81,12 @@
     // Include common prose descendants with their own colors; never overwrite inline styles.
     sheet.textContent = `.${flagClass},.${flagClass} :is(div,section,p,span,a,em,strong,b,i,u,s,small,mark,blockquote,li,h1,h2,h3,h4,h5,h6){color:#d00!important;-webkit-text-fill-color:#d00!important}\n::highlight(${flagClass}){color:#d00}`;
     document.documentElement.append(sheet);
+  }
+  function belowThreshold(result) {
+    return C.validModelIdentity(result) && result.status === "complete" && !result.truncated
+      && Number.isFinite(result.max_score) && result.max_score < config.flagThreshold
+      && Array.isArray(result.chunks) && result.chunks.length > 0
+      && result.chunks.every(chunk => chunk.words >= C.MIN_WORDS);
   }
   function updateStatus(detail) {
     if (detail !== undefined) status.detail = detail;
@@ -238,6 +246,8 @@
         if (record.block.scale !== "context" && selectedKeys.get(key) !== record.block.text) removeRecord(key);
       }
       status.analyzed = 0;
+      status.belowThreshold = 0;
+      countedLocalResults = [];
       status.contextAnalyzed = 0;
       status.partial = 0;
       status.scannedWords = 0;
@@ -284,6 +294,8 @@
         if (C.shouldFlag(result, config) && !mark(block, index)) return;
         status.scannedWords += words;
         status.analyzed++;
+        countedLocalResults.push(result);
+        if (belowThreshold(result)) status.belowThreshold++;
         if (result.status === "partial" || result.truncated
           || result.chunks.some(chunk => chunk.words < C.MIN_WORDS)) status.partial++;
         updateStatus();
@@ -390,6 +402,7 @@
     }, 800);
   }
   function reapplyThreshold() {
+    status.belowThreshold = countedLocalResults.filter(belowThreshold).length;
     prune();
     const selected = C.selectBlocks(document, view);
     const blocks = [...selected.blocks, ...contexts.filter(block => C.groupCurrent(block, view))];
@@ -437,7 +450,8 @@
     timer = undefined;
     // Mutations and Off/On share a budget; a new SPA page gets a fresh one.
     if (!reauthorizing) {
-      status = { state: "starting", analyzed: 0, partial: 0, skipped: 0, marked: 0, limited: false,
+      countedLocalResults = [];
+      status = { state: "starting", analyzed: 0, belowThreshold: 0, partial: 0, skipped: 0, marked: 0, limited: false,
         scannedWords: 0, totalWords: 0, usedWords, findings: [], detail: "" };
     } else {
       status.state = "starting";

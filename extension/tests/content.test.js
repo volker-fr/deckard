@@ -377,6 +377,110 @@ test("a complete 50-word passage is scored and marked without changing the cutof
   assert.equal(globalThis.DeckardCore.FLAG_THRESHOLD, 0.97);
 });
 
+test("below-threshold counts partition complete local scores at the inclusive flag boundary", async () => {
+  for (const max_score of [0.5, 0.969999, 0.97, 0.99]) {
+    const h = await harness();
+    await h.start();
+    await h.finish(0, { ...result, max_score });
+    const status = await h.send({ type: "PAGE_STATUS" });
+    assert.equal(status.belowThreshold, max_score < 0.97 ? 1 : 0);
+    // This fixture has no separate context marks or partial context results.
+    assert.equal(status.analyzed, status.partial + status.belowThreshold + status.marked);
+  }
+});
+
+test("local counts partition analyzed passages before independent context processing", async () => {
+  const h = await harness({ count: 7, planHandler: () => new Promise(() => {}) });
+  await h.start();
+  const results = [
+    { ...result, max_score: 0.5 }, result, { ...result, max_score: 0.97 },
+    { ...result, status: "partial" }, { ...result, truncated: true },
+    { ...result, chunks: [{ ...result.chunks[0], words: 25 }] },
+    { ...result, status: "skipped", chunks: [] },
+  ];
+  for (const [index, value] of results.entries()) await h.finish(index, value);
+  const status = await h.send({ type: "PAGE_STATUS" });
+  assert.equal(status.contextAnalyzed, 0);
+  assert.equal(status.analyzed, 6);
+  assert.equal(status.partial, 3);
+  assert.equal(status.belowThreshold, 1);
+  assert.equal(status.marked, 2);
+  assert.equal(status.skipped, 1);
+  assert.equal(status.analyzed, status.partial + status.belowThreshold + status.marked);
+  await h.send({ type: "STOP" });
+});
+
+test("below-threshold counts exclude incomplete, skipped and unscored local results", async () => {
+  for (const value of [
+    { ...result, status: "partial", max_score: 0.5 },
+    { ...result, truncated: true, max_score: 0.5 },
+    { ...result, chunks: [{ ...result.chunks[0], words: 25 }], max_score: 0.5 },
+    { ...result, status: "skipped", chunks: [], max_score: null },
+    { ...result, chunks: [], max_score: 0.5 },
+    { ...result, max_score: null },
+  ]) {
+    const h = await harness();
+    await h.start(); await h.finish(0, value);
+    assert.equal((await h.send({ type: "PAGE_STATUS" })).belowThreshold, 0);
+  }
+});
+
+test("below-threshold counts follow cached threshold changes, reruns and SPA resets", async () => {
+  const h = await harness({ budget: 80 });
+  assert.equal((await h.send({ type: "PAGE_STATUS" })).belowThreshold, 0);
+  await h.start(); await h.finish(0, { ...result, max_score: 0.85 });
+  assert.equal((await h.send({ type: "PAGE_STATUS" })).belowThreshold, 1);
+  for (const [flagThreshold, expected] of [[0.8, 0], [0.85, 0], [0.9, 1]]) {
+    h.settings.flagThreshold = flagThreshold;
+    await h.send({ type: "SETTINGS_CHANGED" }); await h.settle();
+    assert.equal((await h.send({ type: "PAGE_STATUS" })).belowThreshold, expected);
+  }
+  await h.mutate(h.blocks[0]);
+  assert.equal((await h.send({ type: "PAGE_STATUS" })).belowThreshold, 1);
+  await h.send({ type: "STOP" }); await h.start();
+  assert.equal((await h.send({ type: "PAGE_STATUS" })).belowThreshold, 1);
+  assert.equal(h.analyses.length, 1, "cached reruns and threshold changes spend no inference budget");
+  h.context.location.href = "https://example.com/new-page";
+  h.navigationEvents.get("currententrychange")();
+  await h.flushTimers();
+  assert.equal((await h.send({ type: "PAGE_STATUS" })).belowThreshold, 0);
+  await h.finish(1, result);
+  assert.equal((await h.send({ type: "PAGE_STATUS" })).belowThreshold, 0);
+});
+
+test("rescans discard removed local counts even when their results remain cached", async () => {
+  const h = await harness({ count: 2, budget: 240 });
+  await h.start();
+  await h.finish(0, { ...result, max_score: 0.5 });
+  await h.finish(1, { ...result, max_score: 0.85 });
+  assert.equal((await h.send({ type: "PAGE_STATUS" })).belowThreshold, 2);
+  h.blocks[1].remove();
+  await h.mutate(h.blocks[0]);
+  let status = await h.send({ type: "PAGE_STATUS" });
+  assert.equal(status.analyzed, 1);
+  assert.equal(status.belowThreshold, 1);
+  h.settings.flagThreshold = 0.8;
+  await h.send({ type: "SETTINGS_CHANGED" }); await h.settle();
+  status = await h.send({ type: "PAGE_STATUS" });
+  assert.equal(status.belowThreshold, 1, "removed cached scores do not enter threshold recounts");
+  assert.equal(h.analyses.length, 2);
+});
+
+test("context scores and merged findings do not enter the local below-threshold count", async () => {
+  for (const contextResult of [result, { ...result, max_score: 0.4 }, { ...result, status: "partial" }]) {
+    const h = await harness({ dual: true, count: 2 });
+    await h.start();
+    await h.finish(0, { ...result, max_score: 0.5 });
+    await h.finish(1, { ...result, max_score: 0.5 });
+    await h.finish(2, contextResult);
+    const status = await h.send({ type: "PAGE_STATUS" });
+    assert.equal(status.analyzed, 2);
+    assert.equal(status.contextAnalyzed, 1);
+    assert.equal(status.belowThreshold, 2);
+    assert.equal(status.marked, contextResult === result ? 1 : 0);
+  }
+});
+
 test("low, partial, or short-chunk results leave no page annotations", async () => {
   for (const value of [
     { ...result, score: 0.45, min_score: 0.4, max_score: 0.5 },
